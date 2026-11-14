@@ -1,14 +1,9 @@
 """Sphinx configuration file for an LSST stack package.
 
 This configuration only affects single-package Sphinx documentation builds.
-For more information, see:
-https://developer.lsst.io/stack/building-single-package-docs.html
 """
+# ruff: noqa: F403, F405
 
-from documenteer.conf.pipelinespkg import *
+from documenteer.conf.guide import *
 
-
-project = "gkcoadd"
-html_theme_options["logotext"] = project
-html_title = project
-html_short_title = project
+exclude_patterns.append("changes/*")

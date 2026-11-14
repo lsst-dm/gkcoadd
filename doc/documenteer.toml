@@ -1,0 +1,20 @@
+[project]
+title = "lsst-gkcoadd"
+
+[project.python]
+package = "lsst-gkcoadd"
+
+[build]
+clean = true
+
+[sphinx]
+nitpick_ignore_regex = [
+  ['py:.*', 'lsst\..*'],  # Ignore warnings from links to other lsst packages.
+]
+
+[sphinx.intersphinx.projects]
+astropy = "https://docs.astropy.org/en/stable"
+lsst = "https://pipelines.lsst.io/v/daily"
+numpy = "https://numpy.org/doc/stable/"
+python = "https://docs.python.org/3"
+scipy = "https://docs.scipy.org/doc/scipy/"

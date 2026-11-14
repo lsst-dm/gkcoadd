@@ -52,6 +52,50 @@ version = { attr = "lsst_versions.get_lsst_version" }
 [tool.lsst_versions]
 write_to = "python/lsst/gkcoadd/version.py"
 
+[tool.towncrier]
+    package = "lsst.gkcoadd"
+    package_dir = "python"
+    filename = "doc/lsst.gkcoadd/CHANGES.rst"
+    directory = "doc/changes"
+    title_format = "lsst-gkcoadd {version} ({project_date})"
+    issue_format = "`{issue} <https://rubinobs.atlassian.net/browse/{issue}>`_"
+
+
+    [[tool.towncrier.type]]
+        directory = "feature"
+        name = "New Features"
+        showcontent = true
+
+    [[tool.towncrier.type]]
+        directory = "api"
+        name = "API Changes"
+        showcontent = true
+
+    [[tool.towncrier.type]]
+        directory = "bugfix"
+        name = "Bug Fixes"
+        showcontent = true
+
+    [[tool.towncrier.type]]
+        directory = "perf"
+        name = "Performance Enhancement"
+        showcontent = true
+
+    [[tool.towncrier.type]]
+        directory = "doc"
+        name = "Documentation Improvements"
+        showcontent = true
+
+    [[tool.towncrier.type]]
+        directory = "misc"
+        name = "Miscellaneous Changes of Minor Interest"
+        showcontent = true
+
+    [[tool.towncrier.type]]
+        directory = "removal"
+        name = "An API Removal or Deprecation"
+        showcontent = true
+
 # Present so that pytest does not look for configuration in parent
 # directories. Can otherwise be empty.
 [tool.pytest.ini_options]

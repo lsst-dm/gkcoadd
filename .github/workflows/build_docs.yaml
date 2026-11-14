@@ -1,0 +1,43 @@
+name: docs
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build_sphinx_docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Need to clone everything to determine version from git.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Update pip/wheel infrastructure and install uv
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv
+          uv pip install --system wheel
+
+      - name: Install documentation tools
+        run: uv pip install --system -r doc/requirements.txt
+
+      - name: Install dependencies
+        run: uv pip install --system -r requirements.txt
+
+      - name: Build and install
+        run: uv pip install --system --no-deps -v -e .
+
+      # Documentation for lsst.gkcoadd is published with the rest of the
+      # Science Pipelines documentation, so this job only checks that the
+      # single-package build stays free of warnings.
+      - name: Build documentation
+        working-directory: ./doc
+        run: package-docs build -W -n
