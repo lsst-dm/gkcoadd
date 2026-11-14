@@ -1,0 +1,43 @@
+name: build_and_test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Need to clone everything to determine version from git.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system -r requirements.txt
+
+      # We have two cores so we can speed up the testing with xdist
+      - name: Install pytest packages
+        run: uv pip install --system pytest pytest-xdist pytest-cov
+
+      - name: List installed packages
+        run: pip list -v
+
+      - name: Build and install
+        run: uv pip install --system --no-deps -v -e .
+
+      - name: Run tests
+        run: pytest -r a -v -n 3 --cov=tests --cov=lsst.gkcoadd --cov-report=term
