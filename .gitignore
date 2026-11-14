@@ -1,3 +1,4 @@
+_build.*
 .sconsign.dblite
 config.log
 .sconf_temp
@@ -8,10 +9,13 @@ config.log
 *.pyc
 *_wrap.cc
 *Lib.py
+doc/api
 
-# Built by sconsUtils
+# Built by sconsUtils and lsst-versions
 version.py
 bin/
+*dist-info
+*egg-info
 
 # Pytest
 tests/.tests
