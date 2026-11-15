@@ -9,7 +9,7 @@ clean = true
 
 [sphinx]
 nitpick_ignore_regex = [
-  ['py:.*', 'lsst\..*'],  # Ignore warnings from links to other lsst packages.
+    ['py:.*', 'lsst\..*'], # Ignore warnings from links to other lsst packages.
 ]
 
 [sphinx.intersphinx.projects]
