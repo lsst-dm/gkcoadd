@@ -2,6 +2,4 @@
 gkcoadd
 #######
 
-``gkcoadd`` is a package in the `LSST Science Pipelines <https://pipelines.lsst.io>`_.
-
-.. Add a brief (few sentence) description of what this package provides.
+``gkcoadd`` is an experimental package being developed for the `LSST Science Pipelines <https://pipelines.lsst.io>`_, implementing Kaiser coaddition using Gaussian-convolved warps.
