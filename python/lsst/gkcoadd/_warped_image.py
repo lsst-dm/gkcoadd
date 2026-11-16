@@ -71,10 +71,15 @@ class WarpedImage(MaskedImage):
     band
         Name of the band.
     psf
-        Effective point-spread function for the coadd.  The missing cells
-        reported by ``psf.bounds`` are assumed to apply to all image data for
-        that cell as well (i.e. there is a PSF for a cell if and only if
-        there is image data for that cell).
+        Point-spread function model, processed identically to ``image``.  The
+        missing cells reported by ``psf.bounds`` are assumed to apply to all
+        image data for that cell as well (i.e. there is a PSF for a cell if
+        and only if there is image data for that cell).
+    warp_kernel
+        The transpose of the actual kernel used to warp+convolve ``image``,
+        rendered on the detector pixel grid and then processed the same way as
+        the other image planes.  This is used to whiten the noise on the
+        coadd.
     patch
         Identifiers and geometry of the full patch, if the image is confined
         to a single patch.  When present, the cell grid of the PSF and
@@ -96,6 +101,7 @@ class WarpedImage(MaskedImage):
         sky_projection: SkyProjection[Any] | None = None,
         band: str | None = None,
         psf: CellPointSpreadFunction,
+        warp_kernel: CellPointSpreadFunction,
         patch: PatchDefinition | None = None,
     ):
         super().__init__(
@@ -121,6 +127,7 @@ class WarpedImage(MaskedImage):
         if psf.bounds.bbox != self.bbox:
             psf = psf[self.bbox.intersection(psf.bounds.bbox)]
         self._psf = psf
+        self._warp_kernel = warp_kernel
         self._patch = patch
 
     @property
@@ -168,10 +175,20 @@ class WarpedImage(MaskedImage):
 
     @property
     def psf(self) -> CellPointSpreadFunction:
-        """Effective point-spread function for the coadd
+        """Point-spread function model, processed identically to `image`
         (`CellPointSpreadFunction`).
         """
         return self._psf
+
+    @property
+    def warp_kernel(self) -> CellPointSpreadFunction:
+        """The transpose of the actual kernel used to warp+convolve ``image``,
+        rendered on the detector pixel grid and then processed the same way as
+        the other image planes (`CellPointSpreadFunction`).
+
+        This is used to whiten the noise on the
+        """
+        return self._warp_kernel
 
     @property
     def bounds(self) -> CellGridBounds:
@@ -187,7 +204,6 @@ class WarpedImage(MaskedImage):
 
     def __getitem__(self, bbox: Box | EllipsisType) -> WarpedImage:
         bbox, _ = self._handle_getitem_args(bbox)
-        psf = self.psf[bbox]
         return self._transfer_metadata(
             WarpedImage(
                 self.image[bbox],
@@ -199,7 +215,8 @@ class WarpedImage(MaskedImage):
                 noise_realizations=[v[bbox] for v in self._noise_realizations],
                 noise_guesses=[v[bbox] for v in self._noise_guesses],
                 band=self.band,
-                psf=psf,
+                psf=self.psf[bbox],
+                warp_kernel=self.warp_kernel[bbox],
                 patch=self._patch,
             ),
             bbox=bbox,
@@ -221,6 +238,7 @@ class WarpedImage(MaskedImage):
                 noise_guesses=[v.copy() for v in self._noise_guesses],
                 band=self.band,
                 psf=self.psf,
+                kernel=self.warp_kernel,
                 patch=self._patch,
             ),
             copy=True,
