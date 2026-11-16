@@ -103,6 +103,28 @@ With Gaussian approximations, we know exactly what we have done to the input ima
 We do still need to know the effective PSF on the coadd to much better than those approximations, and this means we need to propagate it separately.
 Fortunately, this is easy: we can just render each input PSF model onto an image (i.e. make a synthetic isolated star), and perform the same operations to those images to coadd them (convolve+warp, then combine with the exact same weights).
 
+This means that the original :math:`\hat{D}(k)` doesn't exist anymore; instead we need to propagate a similar quantity derived from the Gaussian kernels :math:`G_i(x)` we *actually* convolved by, to whiten the noise on the coadd:
+
+.. math::
+
+   \hat s_G(k) &\equiv \sum_i \frac{\hat G_i(k) \hat z_i(k)}{\sigma_i^2}
+   \qquad
+   \hat D_G(k) \equiv \sum_i \frac{|\hat G_i(k)|^2}{\sigma_i^2}
+   \\[6pt]
+   \hat z_c(k) &= \frac{\sigma_c\, \hat s_G(k)}{\sqrt{\hat D_G(k)}},
+   \qquad
+   \sigma_c \equiv \frac{1}{\sqrt{\hat D_G(0)}},
+
+where :math:`\hat z_i(k)` is now the DFT of observation :math:`i`'s fused convolved-and-warped image and :math:`\hat G_i(k)` is the DFT of its Gaussian kernel :math:`G_i`.  The numerator :math:`\hat s_G` has noise power :math:`\hat D_G`, so the division leaves white noise with covariance :math:`C_c = \sigma_c^2 I`, and the gain :math:`\sigma_c` is again fixed by flux conservation, :math:`\hat\phi_c(0) = 1`.
+
+And then we also propagate a different sum to compute the effective coadd PSF:
+
+.. math::
+
+   \hat\phi_c(k) = \frac{\sigma_c}{\sqrt{\hat D_G(k)}} \sum_i \frac{\hat G_i(k) \hat \phi_i(k)}{\sigma_i^2},
+
+Note that :math:`\hat\phi_c` is not itself a propagated image but a ratio of two propagated sums, using the same :math:`\hat D_G` that whitens the data.
+
 Non-stationary Noise
 --------------------
 
