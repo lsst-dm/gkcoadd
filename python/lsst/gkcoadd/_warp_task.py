@@ -21,14 +21,35 @@
 
 from __future__ import annotations
 
-__all__ = ()
+from lsst.utils.logging import LsstLogAdapter
 
+__all__ = ("GaussianKaiserWarpConfig", "GaussianKaiserWarpTask")
+
+import math
 from typing import ClassVar
 
-from lsst.images import SkyProjection, TractFrame, VisitImage
-from lsst.images.cells import PatchDefinition
-from lsst.pex.config import Config, Field, ListField
-from lsst.pipe.base import Task
+import numpy as np
+
+from lsst.images import (
+    XY,
+    YX,
+    Bounds,
+    Box,
+    DetectorFrame,
+    Ellipse,
+    Image,
+    MaskPlane,
+    MaskSchema,
+    NoOverlapError,
+    Polygon,
+    SkyProjection,
+    TractFrame,
+    Transform,
+    VisitImage,
+)
+from lsst.images.cells import CellGridBounds, CellIJ, CellPointSpreadFunction, PatchDefinition
+from lsst.pex.config import Config, DictField, Field
+from lsst.pipe.base import NoWorkFound, Task
 
 from ._warped_image import WarpedImage
 
@@ -48,20 +69,47 @@ class GaussianKaiserWarpConfig(Config):
         default=25,
         dtype=int,
     )
+    transform_edge_length = Field[float](
+        "Maximum length in pixels for any polygon segments transformed "
+        "between detector and tract coordinates.",
+        default=50.0,
+        dtype=float,
+    )
     kernel_n_sigma = Field[float](
         "Truncation point for the Gaussian approximation to the PSF that is "
         "used as the warping/convolution kernel.",
-        default=3.0,
+        default=4.5,
         dtype=float,
     )
-    bad_pixel_mask = ListField[str](
+    bad_mask_planes = DictField(
         "Mask planes that mark pixels considered unusable by this algorithm. "
         "These pixels must still be populated with finite values (e.g. by "
-        "interpolation).",
+        "interpolation).  Dictionary values are descriptions",
+        keytype=str,
+        itemttype=str,
         # TODO[deferred]: check this list more thoroughly against real images
-        default=["NO_DATA", "INTERPOLATED", "CLIPPED", "SATURATED"],
-        dtype=str,
+        default={
+            "NO_DATA": "There was no data for this pixel in this detector.",
+            "INTERPOLATED": "This pixel's value was interpolated prior to warping.",
+            "CLIPPED": "An artifact was detected on this pixel when comparing warps.",
+            "SATURATED": "This pixel was saturated.",
+        },
     )
+    psf_size = Field[int](
+        "Size of warped/convolved PSF images (in both X and Y).",
+        dtype=int,
+        default=41,
+    )
+    n_noise_realizations = Field[int](
+        "Number of noise realizations to generate and warp.",
+        dtype=int,
+        default=3,
+    )
+
+    def validate(self) -> None:
+        super().validate()
+        if "NO_DATA" not in self.bad_mask_planes:
+            raise ValueError("The special NO_DATA plane must always be in bad_mask_planes.")
 
 
 class GaussianKaiserWarpTask(Task):
@@ -70,8 +118,16 @@ class GaussianKaiserWarpTask(Task):
     _DefaultName: ClassVar[str] = "warp"
     ConfigClass: ClassVar[type[GaussianKaiserWarpConfig]] = GaussianKaiserWarpConfig
 
+    config: GaussianKaiserWarpConfig
+    log: LsstLogAdapter
+
     def run(
-        self, visit_image: VisitImage, patch: PatchDefinition, sky_projection: SkyProjection[TractFrame]
+        self,
+        visit_image: VisitImage,
+        patch: PatchDefinition,
+        sky_projection: SkyProjection[TractFrame],
+        band: str,
+        rng_seed_base: int = 0,
     ) -> WarpedImage:
         """Warp a single-detector, single-visit image onto a coadd patch and
         convolve it with a per-cell Gaussian approximation to its PSF.
@@ -86,6 +142,11 @@ class GaussianKaiserWarpTask(Task):
         sky_projection
             The coordinate projection from the target tract coordinate system
             to the sky.
+        band
+            Name of the bandpass filter.
+        rng_seed_base
+            Base random-number generator seed.  The index of the noise
+            realization is added to this number to generate the full seed.
 
         Returns
         -------
@@ -97,4 +158,162 @@ class GaussianKaiserWarpTask(Task):
         lsst.pipe.base.NoWorkFound
             Raised if the number of viable output pixels was too small.
         """
-        raise NotImplementedError("TODO")
+        detector_to_tract = visit_image.sky_projection.pixel_to_sky_transform.then(
+            sky_projection.sky_to_pixel_transform
+        )
+        # The initial bounds here only detects cells that are missing due to
+        # geometry, which isn't as precise as a pixel-level check. But it saves
+        # us from wasting time on cells that definitely have no data, and it
+        # guarantees that all of the cells we process are close enough to the
+        # detector's region that we can trust its sky projection not to
+        # extrapolate catastrophically.
+        bounds = self._init_cell_grid_bounds(visit_image.bounds)
+        patch_warp = self._init_patch_warp(patch, bounds, sky_projection, band)
+        for cell_index in bounds.cell_indices():
+            self._warp_into_cell(
+                patch_warp[bounds.grid.bbox_of(cell_index)],
+                visit_image,
+                detector_to_tract,
+                cell_index=cell_index,
+                rnge_seed_base=rng_seed_base,
+            )
+
+    def _init_cell_grid_bounds(
+        self,
+        detector_bounds: Bounds,
+        patch: PatchDefinition,
+        detector_to_tract: Transform[DetectorFrame, TractFrame],
+    ) -> CellGridBounds:
+        if not isinstance(detector_bounds, Box | Polygon):
+            detector_bounds = detector_bounds.bbox
+        # It's important to start any geometric comparison here by
+        # transforming the detector region to tract coordinates, because the
+        # detector's sky projection might extrapolate badly but the simpler
+        # tract sky projection can't.
+        try:
+            overlap_region = (
+                detector_bounds.segmentize(self.config.transform_edge_length)
+                .transform(detector_to_tract)
+                .intersection(patch.outer_bbox)
+            )
+        except NoOverlapError as err:
+            raise NoWorkFound("No overlap between detector and patch outer bounding box.") from err
+        overlap_region.prepare()
+        missing = {
+            cell_index
+            for cell_index in patch.cells
+            if not overlap_region.overlaps(patch.cells.bbox_of(cell_index))
+        }
+        return CellGridBounds(grid=patch.cells, bbox=patch.outer_bbox, missing=frozenset(missing))
+
+    def _init_patch_warp(
+        self,
+        patch: PatchDefinition,
+        bounds: CellGridBounds,
+        sky_projection: SkyProjection[TractFrame],
+        band: str,
+    ) -> WarpedImage:
+        psf_shape = bounds.subgrid_size + (self.config.psf_size, self.config.psf_size)
+        psf_array = np.zeros(psf_shape, dtype=np.float32)
+        warp_kernel_array = np.zeros(psf_shape, dtype=np.float32)
+        result = WarpedImage(
+            Image(0.0, dtype=np.float32, bbox=patch.outer_bbox),
+            mask_schema=MaskSchema([MaskPlane(k, v) for k, v in self.config.bad_mask_planes.items()]),
+            sky_projection=sky_projection,
+            band=band,
+            psf=CellPointSpreadFunction(psf_array, bounds=bounds),
+            warp_kernel=CellPointSpreadFunction(warp_kernel_array, bounds=bounds),
+            patch=patch,
+        )
+        result.mask.set("NO_DATA")
+        return result
+
+    def _warp_into_cell(
+        self,
+        cell_warp: WarpedImage,
+        visit_image: VisitImage,
+        detector_to_tract: Transform[DetectorFrame, TractFrame],
+        cell_index: CellIJ,
+    ) -> bool:
+        cell_on_detector: Polygon = cell_warp.bbox.segmentize(self.config.transform_edge_length).transform(
+            detector_to_tract.inverted()
+        )
+        try:
+            overlap = visit_image.bounds.intersection(cell_on_detector)
+        except NoOverlapError:
+            return False
+        assert isinstance(overlap, Polygon), (
+            f"Expected cell-detector overlap to be a Polygon, not a {type(overlap).__name__}."
+        )
+        # Work out where we evaluate the PSF model.
+        nominal_tract_eval_point = XY(
+            x=math.floor(cell_warp.bbox.x.center), y=math.floor(cell_warp.bbox.y.center)
+        )
+        tract_eval_point: XY[int] = nominal_tract_eval_point
+        detector_eval_point: XY[float]
+        if overlap != cell_on_detector:
+            # The detector boundary goes through this cell. Take the centroid
+            # of the overlap polygon (in detector coordinates), transform that
+            # to tract coordinates, round it to the nearest integer. We're
+            # willing to assume that the PSF doesn't vary spatially over the
+            # cell (that's fundamental to cell-based coaddition), but we want
+            # to be very defensive about the subpixel phase we evaluate at,
+            # because we know (from DES work) that keeping the coadd pixel
+            # phase constant and averaging over the effectively random
+            # observation pixel phases is okay for shear estimation (even
+            # though we plan to mitigate phase effects in other ways now).
+            tract_eval_point = detector_to_tract.apply_forward(overlap.centroid).map(round)
+        detector_eval_point = detector_to_tract.apply_inverse(tract_eval_point)
+        # Compute the input PSF image and its moments, which determine the
+        # warping kernel.  We want the warp kernel to be separable for
+        # performance reasons, so we ignore psf_ellipse.xy.
+        try:
+            psf_image = visit_image.psf.compute_stellar_image(
+                x=detector_eval_point.x, y=detector_eval_point.y
+            )
+        except Exception:  # TODO[agent]: can we narrow this?
+            self.log.warning("Could not evaluate PSF at %s for cell %s", detector_eval_point, cell_index)
+            return False
+        psf_ellipse = Ellipse.from_image_unweighted(
+            psf_image, x=detector_eval_point.x, y=detector_eval_point.y
+        ).remeasure_adaptive(psf_image)
+        # We take the hull of the transformed cell bbox with the PSF image one
+        # to guard against cases where the PSF is very large and/or was
+        # evaluated close to the edge of the cell, and then we pad to the
+        # kernel's support.  We only want to evaluate the coordinate transform
+        # on a single grid, and this is the simplest way to do that.
+        padded_input_bbox = Box.hull(overlap.bbox, psf_image.bbox).padded(
+            self._kernel_support_half_size(psf_ellipse)
+        )
+        # TODO[perf]: would always_copy=True give us better cache locality
+        # by keeping rows together?
+        padded_input_image = visit_image.image.padded_to(padded_input_bbox)
+        padded_input_mask = visit_image.mask.padded_to(padded_input_bbox, ["NO_DATA"])
+        bad_bitmask = visit_image.mask.schema.bitmask(*self.config.bad_mask_planes)
+        # TODO[agent]: does this broadcast correctly? would a list/array or
+        # indices be better than a boolean mask?
+        bad_pixels = padded_input_mask.array & bad_bitmask
+        # TODO[deferred]: a better conceptual default for variance padding is
+        # inf (both here and in the blank patch-level output image). But
+        # non-finite values are viral, so we need to be very careful, not just
+        # here but downstream as well.
+        padded_input_variance = visit_image.variance.padded_to(padded_input_bbox, math.inf)
+        padded_input_coverage = Image(
+            1.0, dtype=np.float32, bbox=padded_input_bbox, sky_projection=visit_image.sky_projection
+        )
+        padded_input_coverage.array[bad_bitmask] = 0
+        padded_input_guess = Image(
+            0.0, dtype=np.float32, bbox=padded_input_bbox, sky_projection=visit_image.sky_projection
+        )
+        padded_input_guess.array[bad_bitmask] = padded_input_image.array[bad_bitmask]
+        # TODO[next]: generate noise realizations and noise_guess planes
+        # Transform all of the points in the cell.
+        xy_in: XY[np.ndarray] = detector_to_tract.apply_inverse_grid(
+            cell_warp.bbox, in_atol=self.config.transform_atol, out_step=self.config.transform_step
+        )
+
+    def _kernel_support_half_size(self, ellipse: Ellipse) -> YX[int]:
+        return YX(
+            y=math.ceil(self.config.kernel_n_sigma * math.sqrt(ellipse.yy)),
+            x=math.ceil(self.config.kernel_n_sigma * math.sqrt(ellipse.xx)),
+        )
