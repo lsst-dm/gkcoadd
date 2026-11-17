@@ -28,6 +28,7 @@ from types import EllipsisType
 from typing import Any, cast
 
 import astropy.units
+import numpy as np
 
 from lsst.images import Box, Image, Mask, MaskedImage, MaskSchema, SkyProjection, TractFrame
 from lsst.images.cells import CellGrid, CellGridBounds, CellPointSpreadFunction, PatchDefinition
@@ -51,17 +52,23 @@ class WarpedImage(MaskedImage):
     coverage
         The kernel-weighted fraction of the input support that fell on
         good pixels (i.e. a warp of a synthetic input image that is
-        ``1`` for good pixels and ``0`` for bad pixels).
+        ``1`` for good pixels and ``0`` for bad pixels).  Must be
+        dimensionless with the same bounding box as ``image`` if provided.
+        Values default to ``0.0``, meaning no data.
     image_guess
         The kernel-weighted average of the input image over bad pixels only
         (i.e. a warp of a synthetic input image that is ``0`` for good pixels
-        and the current best guess for bad pixels).
+        and the current best guess for bad pixels).  Must have the same units
+        and bounding box as ``image`` if provided.  Values default to ``0.0``.
     noise_realizations
         A sequence of images with Monte Carlo realizations of the noise in
-        the image.
+        the image.  Each must have the same units and bounding box as
+        ``image``.
     noise_guesses
-        A sequence of images analogous to ``image_guess`, with elements
-        corresponding to ``noise_realizations``.
+        A sequence of images analogous to ``image_guess``, with elements
+        corresponding to ``noise_realizations``.  May be empty if
+        ``noise_realizations`` is not, in which case each element defaults to
+        an image of zeros.
     mask_schema
         Schema for the mask plane.  Must be provided if and only if ``mask`` is
         not provided.
@@ -117,18 +124,64 @@ class WarpedImage(MaskedImage):
             raise TypeError("The sky_projection component of a WarpedImage cannot be None.")
         if not isinstance(self.image.sky_projection.pixel_frame, TractFrame):
             raise TypeError("The sky_projection's pixel frame must be a TractFrame for WarpedImage.")
-        # TODO[trivial]: make sure these additional image planes have the right
-        # units, bbox, and projection, and replace None with empty images.
-        self._coverage = coverage
-        self._image_guess = image_guess
-        self._noise_realizations = list(noise_realizations)
-        self._noise_guesses = list(noise_guesses)
+        if len(noise_guesses) not in (0, len(noise_realizations)):
+            raise ValueError(
+                "The noise_guesses sequence must be empty or have the same length as noise_realizations."
+            )
+        self._coverage = self._init_plane(coverage, name="coverage", unit=None)
+        self._image_guess = self._init_plane(image_guess, name="image_guess", unit=self.image.unit)
+        self._noise_realizations = [
+            self._init_plane(v, name="noise_realizations", unit=self.image.unit) for v in noise_realizations
+        ]
+        self._noise_guesses = [
+            self._init_plane(v, name="noise_guesses", unit=self.image.unit)
+            for v in (noise_guesses or (None,) * len(noise_realizations))
+        ]
         self._band = band
         if psf.bounds.bbox != self.bbox:
             psf = psf[self.bbox.intersection(psf.bounds.bbox)]
         self._psf = psf
         self._warp_kernel = warp_kernel
         self._patch = patch
+
+    def _init_plane(self, plane: Image | None, *, name: str, unit: astropy.units.UnitBase | None) -> Image:
+        """Check an additional image plane against the main image, or replace a
+        missing one with a default image of zeros.
+
+        Parameters
+        ----------
+        plane
+            The image plane to check, or `None` for the default.  Zeros are
+            appropriate for missing data: no coverage and no guess.
+        name
+            Name of the plane, used in error messages.
+        unit
+            Units the plane must have, matching the main image.  `None` means
+            the plane must be dimensionless.
+
+        Returns
+        -------
+        plane : `~lsst.images.Image`
+            The plane, with its sky projection replaced by this image's.
+        """
+        if plane is None:
+            return Image(
+                0.0,
+                dtype=np.float32,
+                bbox=self.bbox,
+                unit=unit,
+                sky_projection=self.sky_projection,
+            )
+        if plane.bbox != self.bbox:
+            raise ValueError(f"Image ({self.bbox}) and {name} ({plane.bbox}) bboxes do not agree.")
+        if unit is None:
+            if plane.unit is not None and plane.unit != astropy.units.dimensionless_unscaled:
+                raise ValueError(f"{name} must be dimensionless, not {plane.unit}.")
+        elif plane.unit is None:
+            plane = plane.view(unit=unit)
+        elif plane.unit != unit:
+            raise ValueError(f"{name} unit ({plane.unit}) should be the same as the image's ({unit}).")
+        return plane.view(sky_projection=self.sky_projection)
 
     @property
     def skymap(self) -> str:
@@ -238,7 +291,7 @@ class WarpedImage(MaskedImage):
                 noise_guesses=[v.copy() for v in self._noise_guesses],
                 band=self.band,
                 psf=self.psf,
-                kernel=self.warp_kernel,
+                warp_kernel=self.warp_kernel,
                 patch=self._patch,
             ),
             copy=True,
