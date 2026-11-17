@@ -28,6 +28,7 @@ __all__ = ("GaussianKaiserWarpConfig", "GaussianKaiserWarpTask")
 import math
 from typing import ClassVar
 
+import astropy.units
 import numpy as np
 
 from lsst.images import (
@@ -84,9 +85,9 @@ class GaussianKaiserWarpConfig(Config):
     bad_mask_planes = DictField(
         "Mask planes that mark pixels considered unusable by this algorithm. "
         "These pixels must still be populated with finite values (e.g. by "
-        "interpolation).  Dictionary values are descriptions",
+        "interpolation).  Dictionary values are descriptions.",
         keytype=str,
-        itemttype=str,
+        itemtype=str,
         # TODO[deferred]: check this list more thoroughly against real images
         default={
             "NO_DATA": "There was no data for this pixel in this detector.",
@@ -167,15 +168,14 @@ class GaussianKaiserWarpTask(Task):
         # guarantees that all of the cells we process are close enough to the
         # detector's region that we can trust its sky projection not to
         # extrapolate catastrophically.
-        bounds = self._init_cell_grid_bounds(visit_image.bounds)
-        patch_warp = self._init_patch_warp(patch, bounds, sky_projection, band)
+        bounds = self._init_cell_grid_bounds(visit_image.bounds, patch, detector_to_tract)
+        patch_warp = self._init_patch_warp(patch, bounds, sky_projection, band, visit_image.image.unit)
         for cell_index in bounds.cell_indices():
             self._warp_into_cell(
                 patch_warp[bounds.grid.bbox_of(cell_index)],
                 visit_image,
                 detector_to_tract,
                 cell_index=cell_index,
-                rnge_seed_base=rng_seed_base,
             )
 
     def _init_cell_grid_bounds(
@@ -194,7 +194,7 @@ class GaussianKaiserWarpTask(Task):
             overlap_region = (
                 detector_bounds.segmentize(self.config.transform_edge_length)
                 .transform(detector_to_tract)
-                .intersection(patch.outer_bbox)
+                .intersection(Polygon.from_box(patch.outer_bbox))
             )
         except NoOverlapError as err:
             raise NoWorkFound("No overlap between detector and patch outer bounding box.") from err
@@ -202,7 +202,7 @@ class GaussianKaiserWarpTask(Task):
         missing = {
             cell_index
             for cell_index in patch.cells
-            if not overlap_region.overlaps(patch.cells.bbox_of(cell_index))
+            if not overlap_region.overlaps(patch.cells.bbox_of(cell_index).to_polygon())
         }
         return CellGridBounds(grid=patch.cells, bbox=patch.outer_bbox, missing=frozenset(missing))
 
@@ -212,12 +212,13 @@ class GaussianKaiserWarpTask(Task):
         bounds: CellGridBounds,
         sky_projection: SkyProjection[TractFrame],
         band: str,
+        unit: astropy.units.UnitBase,
     ) -> WarpedImage:
-        psf_shape = bounds.subgrid_size + (self.config.psf_size, self.config.psf_size)
+        psf_shape = bounds.subgrid_size.as_tuple() + (self.config.psf_size, self.config.psf_size)
         psf_array = np.zeros(psf_shape, dtype=np.float32)
         warp_kernel_array = np.zeros(psf_shape, dtype=np.float32)
         result = WarpedImage(
-            Image(0.0, dtype=np.float32, bbox=patch.outer_bbox),
+            Image(0.0, dtype=np.float32, bbox=patch.outer_bbox, unit=unit),
             mask_schema=MaskSchema([MaskPlane(k, v) for k, v in self.config.bad_mask_planes.items()]),
             sky_projection=sky_projection,
             band=band,
@@ -290,9 +291,7 @@ class GaussianKaiserWarpTask(Task):
         padded_input_image = visit_image.image.padded_to(padded_input_bbox)
         padded_input_mask = visit_image.mask.padded_to(padded_input_bbox, ["NO_DATA"])
         bad_bitmask = visit_image.mask.schema.bitmask(*self.config.bad_mask_planes)
-        # TODO[agent]: does this broadcast correctly? would a list/array or
-        # indices be better than a boolean mask?
-        bad_pixels = padded_input_mask.array & bad_bitmask
+        bad_pixels = (padded_input_mask.array & bad_bitmask).any(axis=-1)
         # TODO[deferred]: a better conceptual default for variance padding is
         # inf (both here and in the blank patch-level output image). But
         # non-finite values are viral, so we need to be very careful, not just
@@ -301,11 +300,11 @@ class GaussianKaiserWarpTask(Task):
         padded_input_coverage = Image(
             1.0, dtype=np.float32, bbox=padded_input_bbox, sky_projection=visit_image.sky_projection
         )
-        padded_input_coverage.array[bad_bitmask] = 0
+        padded_input_coverage.array[bad_pixels] = 0
         padded_input_guess = Image(
             0.0, dtype=np.float32, bbox=padded_input_bbox, sky_projection=visit_image.sky_projection
         )
-        padded_input_guess.array[bad_bitmask] = padded_input_image.array[bad_bitmask]
+        padded_input_guess.array[bad_pixels] = padded_input_image.array[bad_pixels]
         # TODO[next]: generate noise realizations and noise_guess planes
         # Transform all of the points in the cell.
         xy_in: XY[np.ndarray] = detector_to_tract.apply_inverse_grid(
