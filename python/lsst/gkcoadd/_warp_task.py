@@ -28,10 +28,11 @@ from lsst.utils.logging import LsstLogAdapter
 __all__ = ("GaussianKaiserWarpConfig", "GaussianKaiserWarpTask")
 
 import math
-from typing import Any, ClassVar
+from typing import Any, ClassVar, final
 
 import astropy.units
 import numpy as np
+from astro_metadata_translator import ObservationInfo
 
 from lsst.images import (
     XY,
@@ -46,16 +47,18 @@ from lsst.images import (
     MaskSchema,
     NoOverlapError,
     Polygon,
+    Region,
     SkyProjection,
     TractFrame,
     Transform,
     VisitImage,
 )
-from lsst.images.cells import CellGridBounds, CellIJ, CellPointSpreadFunction, PatchDefinition
-from lsst.pex.config import Config, DictField, Field
-from lsst.pipe.base import NoWorkFound, Task
+from lsst.images.cells import CellGrid, CellIJ, PatchDefinition
+from lsst.pex.config import Config, DictField, Field, ListField
+from lsst.pipe.base import InvalidQuantumError, NoWorkFound, Task, UpstreamFailureNoWorkFound
 
-from ._warped_image import BaseWarpImage, WarpedImage
+from ._cell_kernel import CellKernelWorkspace
+from ._warped_image import BaseWarpImage, MissingCellReason, WarpedImage, WarpFields
 
 
 class GaussianKaiserWarpConfig(Config):
@@ -104,10 +107,17 @@ class GaussianKaiserWarpConfig(Config):
         dtype=int,
         default=41,
     )
-    n_noise_realizations = Field[int](
-        "Number of noise realizations to generate and warp.",
+    noise_realization_sources = ListField[str](
+        "A list of variance sources to use for each noise realization. "
+        "Values may be 'pixel' for the per-pixel variance plane or an ObservationSummaryStats field like "
+        "'skyNoise' or 'meanVar' for constant (before calibration) per-detector noise.",
+        dtype=str,
+        default=["meanVar"] * 3,
+    )
+    noise_seed_offset = Field[int](
+        "An offset added to the random number seed for all noise realizations.",
         dtype=int,
-        default=3,
+        default=0,
     )
 
     def validate(self) -> None:
@@ -125,13 +135,18 @@ class GaussianKaiserWarpTask(Task):
     config: GaussianKaiserWarpConfig
     log: LsstLogAdapter
 
+    def __init__(self, config: Config | None = None, **kwargs: Any):
+        super().__init__(config, **kwargs)
+        self.mask_schema = MaskSchema([MaskPlane(k, v) for k, v in self.config.bad_mask_planes.items()])
+
     def run(
         self,
+        *,
         visit_image: VisitImage,
         patch: PatchDefinition,
         sky_projection: SkyProjection[TractFrame],
         band: str,
-        rng_seed_base: int = 0,
+        calibration_scaling: Image | None = None,
     ) -> WarpedImage:
         """Warp a single-detector, single-visit image onto a coadd patch and
         convolve it with a per-cell Gaussian approximation to its PSF.
@@ -139,7 +154,8 @@ class GaussianKaiserWarpTask(Task):
         Parameters
         ----------
         visit_image
-            The input image to warp.
+            The input image to warp.  Expected to already have calibrated
+            pixel units.
         patch
             The definition of the cell grid for PSF (and other) approximations,
             along with identifiers for this patch.
@@ -148,9 +164,10 @@ class GaussianKaiserWarpTask(Task):
             to the sky.
         band
             Name of the bandpass filter.
-        rng_seed_base
-            Base random-number generator seed.  The index of the noise
-            realization is added to this number to generate the full seed.
+        calibration_scaling
+            A rendered image of the mapping from instrumental units (as used
+            by `lsst.images.ObservationSummaryStats` fields) to the visit
+            image's calibrated units.  Computed on first use if not provided.
 
         Returns
         -------
@@ -165,28 +182,44 @@ class GaussianKaiserWarpTask(Task):
         detector_to_tract = visit_image.sky_projection.pixel_to_sky_transform.then(
             sky_projection.sky_to_pixel_transform
         )
-        # The initial bounds here only detects cells that are missing due to
-        # geometry, which isn't as precise as a pixel-level check. But it saves
-        # us from wasting time on cells that definitely have no data, and it
-        # guarantees that all of the cells we process are close enough to the
-        # detector's region that we can trust its sky projection not to
-        # extrapolate catastrophically.
-        bounds = self._init_cell_grid_bounds(visit_image.bounds, patch, detector_to_tract)
-        patch_warp = self._init_patch_warp(patch, bounds, sky_projection, band, visit_image.image.unit)
-        for cell_index in bounds.cell_indices():
-            self._warp_into_cell(
-                patch_warp[bounds.grid.bbox_of(cell_index)],
-                visit_image,
-                detector_to_tract,
-                cell_index=cell_index,
-            )
+        workspace = _PatchWarpWorkspace.make_empty(
+            patch,
+            sky_projection,
+            len(self.config.noise_realization_sources),
+            mask_schema=self.mask_schema,
+            psf_shape=YX(y=self.config.psf_size, x=self.config.psf_size),
+        )
+        overlap_region = self._compute_coarse_overlap(visit_image.bounds, patch, detector_to_tract)
+        # For consistency across patches, we need to generate full-detector
+        # noise realizations up front (and rng_seed_base needs to encode)
+        noise_realizations = self._generate_noise(visit_image, calibration_scaling=calibration_scaling)
+        for cell_index in patch.cells:
+            cell_bbox = patch.cells.bbox_of(cell_index)
+            if not overlap_region.intersects(cell_bbox.to_polygon()):
+                # The 'empty' state of a workspace cell already matches this
+                # condition.
+                continue
+            if (
+                missing_reason := self._warp_into_cell(
+                    workspace[cell_index],
+                    visit_image,
+                    noise_realizations,
+                    detector_to_tract,
+                    cell_index=cell_index,
+                )
+            ) is not None:
+                workspace.missing[cell_index] = missing_reason
+        return workspace.finish(visit_image.obs_info, band, patch)
 
-    def _init_cell_grid_bounds(
+    def _compute_coarse_overlap(
         self,
         detector_bounds: Bounds,
         patch: PatchDefinition,
         detector_to_tract: Transform[DetectorFrame, TractFrame],
-    ) -> CellGridBounds:
+    ) -> Region:
+        """Compute the coarse overlap between the detector-level input image
+        and the patch, as a coadd-coordinate region.
+        """
         if not isinstance(detector_bounds, Box | Polygon):
             detector_bounds = detector_bounds.bbox
         # It's important to start any geometric comparison here by
@@ -202,50 +235,81 @@ class GaussianKaiserWarpTask(Task):
         except NoOverlapError as err:
             raise NoWorkFound("No overlap between detector and patch outer bounding box.") from err
         overlap_region.prepare()
-        missing = {
-            cell_index
-            for cell_index in patch.cells
-            if not overlap_region.intersects(patch.cells.bbox_of(cell_index).to_polygon())
-        }
-        return CellGridBounds(grid=patch.cells, bbox=patch.outer_bbox, missing=frozenset(missing))
+        return overlap_region
 
-    def _init_patch_warp(
-        self,
-        patch: PatchDefinition,
-        bounds: CellGridBounds,
-        sky_projection: SkyProjection[TractFrame],
-        band: str,
-        unit: astropy.units.UnitBase,
-    ) -> WarpedImage:
-        psf_shape = bounds.subgrid_size.as_tuple() + (self.config.psf_size, self.config.psf_size)
-        psf_array = np.zeros(psf_shape, dtype=np.float32)
-        warp_kernel_array = np.zeros(psf_shape, dtype=np.float32)
-        result = WarpedImage(
-            Image(0.0, dtype=np.float32, bbox=patch.outer_bbox, unit=unit),
-            mask_schema=MaskSchema([MaskPlane(k, v) for k, v in self.config.bad_mask_planes.items()]),
-            sky_projection=sky_projection,
-            band=band,
-            psf=CellPointSpreadFunction(psf_array, bounds=bounds),
-            warp_kernel=CellPointSpreadFunction(warp_kernel_array, bounds=bounds),
-            patch=patch,
-        )
-        result.mask.set("NO_DATA")
+    def _generate_noise(
+        self, visit_image: VisitImage, calibration_scaling: Image | None = None
+    ) -> list[Image]:
+        """Generate full-detector noise images.
+
+        Parameters
+        ----------
+        visit_image
+            Image whose projection, units, and noise properties the noise
+            images should reflect.
+        calibration_scaling
+            A rendered image of the mapping from instrumental units (as used
+            by `lsst.images.ObservationSummaryStats` fields) to the visit
+            image's calibrated units.  Computed on first use if not provided.
+        """
+        result: list[Image] = []
+        for index, noise_source in enumerate(self.config.noise_realization_sources):
+            # TODO[agent]: is detector_exposure_id reliably populated in
+            # from_legacy conversions, or do we need a fallback? Also, should
+            # we be using SeedSequence here instead of index offsets somehow?
+            if visit_image.obs_info.detector_exposure_id is None:
+                raise InvalidQuantumError("ObservationInfo.detector_exposure_id is not populated.")
+            seed = visit_image.obs_info.detector_exposure_id + self.config.noise_seed_offset + index
+            # TODO[agent]: does numpy have a native float32 RNG we should use
+            # instead?
+            rng = np.random.default_rng(seed)
+            is_calibrated = False
+            match noise_source:
+                case "pixel":
+                    array = rng.normal(scale=visit_image.variance.array**0.5).astype(np.float32)
+                    is_calibrated = True
+                case "meanVar":
+                    array = rng.normal(
+                        scale=visit_image.summary_stats.meanVar**0.5, size=visit_image.bbox.shape
+                    ).astype(np.float32)
+                case "skyNoise":
+                    array = rng.normal(
+                        scale=visit_image.summary_stats.skyNoise, size=visit_image.bbox.shape
+                    ).astype(np.float32)
+            if not is_calibrated:
+                if calibration_scaling is None:
+                    if visit_image.photometric_scaling is None:
+                        raise UpstreamFailureNoWorkFound("Visit image has no photometric calibration.")
+                    calibration_scaling = visit_image.photometric_scaling.render(
+                        visit_image.bbox, dtype=np.float32
+                    )
+                array *= calibration_scaling.array
+            result.append(
+                Image(
+                    array,
+                    dtype=np.float32,
+                    bbox=visit_image.bbox,
+                    unit=visit_image.unit,
+                    sky_projection=visit_image.sky_projection,
+                )
+            )
         return result
 
     def _warp_into_cell(
         self,
-        cell_warp: WarpedImage,
+        output_workspace: _SingleCellWarpWorkspace,
         visit_image: VisitImage,
+        noise_realizations: list[Image],
         detector_to_tract: Transform[DetectorFrame, TractFrame],
         cell_index: CellIJ,
-    ) -> bool:
-        cell_on_detector: Polygon = cell_warp.bbox.segmentize(self.config.transform_edge_length).transform(
-            detector_to_tract.inverted()
-        )
+    ) -> MissingCellReason | None:
+        cell_on_detector: Polygon = output_workspace.bbox.segmentize(
+            self.config.transform_edge_length
+        ).transform(detector_to_tract.inverted())
         try:
             overlap = visit_image.bounds.intersection(cell_on_detector)
         except NoOverlapError:
-            return False
+            return MissingCellReason.NO_COARSE_OVERLAP
         match overlap:
             case Box():
                 overlap = overlap.to_polygon()
@@ -253,10 +317,10 @@ class GaussianKaiserWarpTask(Task):
                 pass
             case _:
                 self.log.warning("Visit bounds intersection with cell %s is not a polygon.", cell_index)
-                return False
+                return MissingCellReason.UNEXPECTED_OVERLAP_GEOMETRY
         # Work out where we evaluate the PSF model.
         nominal_tract_eval_point = XY(
-            x=math.floor(cell_warp.bbox.x.center), y=math.floor(cell_warp.bbox.y.center)
+            x=math.floor(output_workspace.bbox.x.center), y=math.floor(output_workspace.bbox.y.center)
         )
         tract_eval_point: XY[int] = nominal_tract_eval_point
         detector_eval_point: XY[float]
@@ -272,7 +336,7 @@ class GaussianKaiserWarpTask(Task):
             # observation pixel phases is okay for shear estimation (even
             # though we plan to mitigate phase effects in other ways now).
             tract_eval_point = detector_to_tract.apply_forward(overlap.centroid).map(round)
-        detector_eval_point = detector_to_tract.apply_inverse(tract_eval_point)
+        detector_eval_point = detector_to_tract.apply_inverse(tract_eval_point.map(float))
         # Compute the input PSF image and its moments, which determine the
         # warping kernel.  We want the warp kernel to be separable for
         # performance reasons, so we ignore psf_ellipse.xy.
@@ -282,7 +346,7 @@ class GaussianKaiserWarpTask(Task):
             )
         except Exception:  # TODO[agent]: can we narrow this?
             self.log.warning("Could not evaluate PSF at %s for cell %s", detector_eval_point, cell_index)
-            return False
+            return MissingCellReason.FAILED_PSF_EVALUATION
         psf_ellipse = Ellipse.from_image_unweighted(
             psf_image, x=detector_eval_point.x, y=detector_eval_point.y
         ).remeasure_adaptive(psf_image)
@@ -294,30 +358,19 @@ class GaussianKaiserWarpTask(Task):
         padded_input_bbox = Box.hull(overlap.bbox, psf_image.bbox).padded(
             self._kernel_support_half_size(psf_ellipse)
         )
-        # TODO[perf]: would always_copy=True give us better cache locality
-        # by keeping rows together?
-        padded_input_image = visit_image.image.padded_to(padded_input_bbox)
-        padded_input_mask = visit_image.mask.padded_to(padded_input_bbox, ["NO_DATA"])
-        bad_bitmask = visit_image.mask.schema.bitmask(*self.config.bad_mask_planes)
-        bad_pixels = (padded_input_mask.array & bad_bitmask).any(axis=-1)
-        # TODO[deferred]: a better conceptual default for variance padding is
-        # inf (both here and in the blank patch-level output image). But
-        # non-finite values are viral, so we need to be very careful, not just
-        # here but downstream as well.
-        padded_input_variance = visit_image.variance.padded_to(padded_input_bbox, math.inf)
-        padded_input_coverage = Image(
-            1.0, dtype=np.float32, bbox=padded_input_bbox, sky_projection=visit_image.sky_projection
+        input_workspace = _SingleCellWarpWorkspace.from_visit_image(
+            visit_image,
+            psf_image,
+            bbox=padded_input_bbox,
+            bad_mask_planes=list(self.config.bad_mask_planes.keys()),
+            noise_realizations=noise_realizations,
         )
-        padded_input_coverage.array[bad_pixels] = 0
-        padded_input_guess = Image(
-            0.0, dtype=np.float32, bbox=padded_input_bbox, sky_projection=visit_image.sky_projection
-        )
-        padded_input_guess.array[bad_pixels] = padded_input_image.array[bad_pixels]
-        # TODO[next]: generate noise realizations and noise_guess planes
+        self._render_warp_kernel(input_workspace.warp_kernel, psf_ellipse)
         # Transform all of the points in the cell.
-        xy_in: XY[np.ndarray] = detector_to_tract.apply_inverse_grid(
-            cell_warp.bbox, in_atol=self.config.transform_atol, out_step=self.config.transform_step
+        xy: XY[np.ndarray] = detector_to_tract.apply_inverse_grid(
+            output_workspace.bbox, in_atol=self.config.transform_atol, out_step=self.config.transform_step
         )
+        return self._do_warp(output_workspace, input_workspace, psf_ellipse, xy)
 
     def _kernel_support_half_size(self, ellipse: Ellipse) -> YX[int]:
         return YX(
@@ -325,30 +378,180 @@ class GaussianKaiserWarpTask(Task):
             x=math.ceil(self.config.kernel_n_sigma * math.sqrt(ellipse.xx)),
         )
 
+    def _render_warp_kernel(self, image: Image, psf_ellipse: Ellipse) -> None:
+        g = image.bbox.meshgrid()
+        g.x[...] -= psf_ellipse.center.x
+        g.y[...] -= psf_ellipse.center.y
+        np.square(g.x, out=g.x)
+        np.square(g.y, out=g.y)
+        arg = g.x / psf_ellipse.xx + g.y / psf_ellipse.yy
+        mask = arg < self.config.kernel_n_sigma
+        image.array[mask] = np.exp(-0.5 * arg[mask])
 
-class _WarpWorkspace(BaseWarpImage):
-    def __init__(
+    def _do_warp(
         self,
-        image: Image,
-        *,
-        mask: Mask,
-        variance: Image,
-        coverage: Image,
-        image_guess: Image,
+        output_workspace: _SingleCellWarpWorkspace,
+        input_workspace: _SingleCellWarpWorkspace,
+        kernel_ellipse: Ellipse,
+        xy: XY[np.ndarray],
+    ) -> MissingCellReason | None:
+        """Actually do the warping.
+
+        Parameters
+        ----------
+        output_workspace
+            Output warped image cell to write into.
+        input_workspace
+            Input padded-as-needed visit image and synthetic planes to warp
+            from.  Guaranteed to have full kernel support over every output
+            pixel.
+        kernel_ellipse
+            The ellipse that defines the Gaussian warping kernel.
+        xy
+            Arrays with the input pixel coordinate value for every output
+            pixels; shapes are the same as ``output_workspace.bbox.shape``.
+        """
+        raise NotImplementedError("TODO")
+
+
+@final
+class _SingleCellWarpWorkspace(BaseWarpImage[Image]):
+    @classmethod
+    def from_visit_image(
+        cls,
+        visit_image: VisitImage,
+        psf_image: Image,
+        bbox: Box,
+        bad_mask_planes: Sequence[str],
         noise_realizations: Sequence[Image],
-        noise_guesses: Sequence[Image],
-        mask_schema: MaskSchema,
-        sky_projection: SkyProjection[Any],
-        psf: Image,
-    ):
-        super().__init__(
-            image=image,
-            mask=mask,
-            variance=variance,
-            coverage=coverage,
-            image_guess=image_guess,
-            noise_realizations=noise_realizations,
-            noise_guesses=noise_guesses,
-            mask_schema=mask_schema,
-            sky_projection=sky_projection,
+    ) -> _SingleCellWarpWorkspace:
+        # 'Any' here silences MyPy grumpiness about using **kwargs.
+        common_kwargs: Any = {"dtype": np.float32, "bbox": bbox, "sky_projection": visit_image.sky_projection}
+        result = cls(
+            {
+                "image": visit_image.image.padded_to(bbox),
+                "mask": visit_image.mask.padded_to(bbox, ["NO_DATA"]),
+                "variance": visit_image.variance.padded_to(bbox, math.inf),
+                "coverage": Image(1.0, unit=None, **common_kwargs),
+                "image_guess": Image(0.0, unit=visit_image.unit, **common_kwargs),
+                # TODO: populate noise realizations once we've nailed down the
+                # RNG handling
+                "noise_realizations": [r.padded_to(bbox) for r in noise_realizations],
+                "noise_guesses": [
+                    Image(0.0, unit=visit_image.unit, **common_kwargs) for _ in noise_realizations
+                ],
+                "psf": psf_image.padded_to(bbox).view(sky_projection=visit_image.sky_projection),
+                "warp_kernel": Image(0.0, unit=None, **common_kwargs),
+            }
         )
+        bad_bitmask = result.mask.schema.bitmask(*bad_mask_planes)
+        bad_pixels = (result.mask.array & bad_bitmask).any(axis=-1)
+        result.coverage.array[bad_pixels] = 0
+        result.image_guess.array[bad_pixels] = result.image.array[bad_pixels]
+        for r, g in zip(result.noise_realizations, result.noise_guesses):
+            g.array[bad_pixels] = r.array[bad_pixels]
+        return result
+
+    def _make_modified(self, fields: WarpFields) -> _SingleCellWarpWorkspace:
+        return _SingleCellWarpWorkspace(fields)
+
+
+@final
+class _PatchWarpWorkspace(BaseWarpImage[CellKernelWorkspace]):
+    """An under-construction warped image covering a full patch."""
+
+    def __init__(self, fields: WarpFields, missing: dict[CellIJ, MissingCellReason]):
+        super().__init__(fields)
+        self._missing = missing
+
+    @classmethod
+    def make_empty(
+        cls,
+        patch: PatchDefinition,
+        sky_projection: SkyProjection[TractFrame],
+        n_noise_realizations: int,
+        mask_schema: MaskSchema,
+        psf_shape: YX[int],
+    ) -> _PatchWarpWorkspace:
+        # 'Any' here silences MyPy grumpiness about using **kwargs.
+        common_kwargs: Any = {"bbox": patch.outer_bbox, "sky_projection": sky_projection, "dtype": np.float32}
+        return cls(
+            {
+                "image": Image(0.0, unit=astropy.units.nJy, **common_kwargs),
+                "mask": Mask(
+                    mask_schema.bitmask("NO_DATA"),
+                    schema=mask_schema,
+                    bbox=patch.outer_bbox,
+                    sky_projection=sky_projection,
+                ),
+                "variance": Image(np.inf, unit=astropy.units.nJy**2, **common_kwargs),
+                "coverage": Image(0.0, unit=None, **common_kwargs),
+                "image_guess": Image(0.0, unit=astropy.units.nJy, **common_kwargs),
+                "noise_realizations": [
+                    Image(0.0, unit=astropy.units.nJy, **common_kwargs) for _ in range(n_noise_realizations)
+                ],
+                "noise_guesses": [
+                    Image(0.0, unit=astropy.units.nJy, **common_kwargs) for _ in range(n_noise_realizations)
+                ],
+                "psf": CellKernelWorkspace.make_empty(psf_shape, patch.cells),
+                "warp_kernel": CellKernelWorkspace.make_empty(psf_shape, patch.cells),
+            },
+            missing=dict.fromkeys(patch.cells, MissingCellReason.NO_COARSE_OVERLAP),
+        )
+
+    @property
+    def grid(self) -> CellGrid:
+        """The patch-level grid of cells (`lsst.images.cells.CellGrid`)."""
+        return self._psf.grid
+
+    @property
+    def missing(self) -> dict[CellIJ, MissingCellReason]:
+        """The cells that do not have any data yet, and why
+        (`dict` [`lsst.images.CellIJ`, `MissingCellReason`]).
+
+        Notes
+        -----
+        This is initialized with all cells missing, and must be updated in
+        concert with the image and kernel fields manuall; no consistency is
+        maintained by this class.
+        """
+        return self._missing
+
+    # Not accepting Box or EllipsisType here is a deliberate Liskov violation;
+    # it's a smaller price to pay than not inheriting from MaskedImage or
+    # implementing Box slicing that nothing would use.
+    def __getitem__(self, index: CellIJ) -> _SingleCellWarpWorkspace:  # type: ignore[override]
+        bbox = self.grid.bbox_of(index)
+        # We use Any because we're switching in place from
+        # WarpFields[CellKernelWorkspace] to WarpFields[Image] via the
+        # assignments below.
+        fields: WarpFields[Any] = self._slice_image_fields(bbox)
+        fields["psf"] = self.psf[index]
+        fields["warp_kernel"] = self.warp_kernel[index]
+        return _SingleCellWarpWorkspace(fields)
+
+    def finish(self, obs_info: ObservationInfo, band: str, patch: PatchDefinition) -> WarpedImage:
+        """Finish building the warp, converting this object into a
+        `WarpedImage`.
+        """
+        return WarpedImage(
+            {
+                "image": self.image,
+                "mask": self.mask,
+                "variance": self.variance,
+                "coverage": self.coverage,
+                "image_guess": self.image_guess,
+                "noise_realizations": list(self.noise_realizations),
+                "noise_guesses": list(self.noise_guesses),
+                "psf": self.psf.finish(self.missing.keys()),
+                "warp_kernel": self.warp_kernel.finish(self.missing.keys()),
+            },
+            obs_info=obs_info,
+            band=band,
+            patch=patch,
+        )
+
+    def _make_modified(self, fields: WarpFields) -> _PatchWarpWorkspace:
+        # We copy self.missing because super().copy() is the only way to get
+        # here; __getitem__ doesn't support bbox slicing.
+        return _PatchWarpWorkspace(fields, self.missing.copy())

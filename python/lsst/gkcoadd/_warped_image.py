@@ -21,136 +21,115 @@
 
 from __future__ import annotations
 
-__all__ = ("WarpedImage",)
+__all__ = ("BaseWarpImage", "MissingCellReason", "WarpFields", "WarpedImage")
 
-from collections.abc import Sequence
+import enum
+from abc import ABC, abstractmethod
+from collections.abc import Iterator, Sequence
 from types import EllipsisType
-from typing import Any, cast
+from typing import Self, TypedDict, cast, final
 
 import astropy.units
-import numpy as np
+from astro_metadata_translator import ObservationInfo
 
-from lsst.images import Box, Image, Mask, MaskedImage, MaskSchema, SkyProjection, TractFrame
-from lsst.images.cells import CellGrid, CellGridBounds, CellPointSpreadFunction, PatchDefinition
+from lsst.images import Box, Image, Mask, MaskedImage, SkyProjection, TractFrame
+from lsst.images.cells import CellGrid, CellGridBounds, PatchDefinition
+
+from ._cell_kernel import CellKernel, CellKernelWorkspace
 
 
-class BaseWarpImage(MaskedImage):
-    """A single-visit, single-detector with the image planes needed for
+class WarpFields[K: CellKernel | CellKernelWorkspace | Image](TypedDict):
+    """A dictionary for the minimal fields of a warp or to-be-warped visit
+    image.
+    """
+
+    image: Image
+    mask: Mask
+    variance: Image
+    coverage: Image
+    image_guess: Image
+    noise_realizations: list[Image]
+    noise_guesses: list[Image]
+    psf: K
+    warp_kernel: K
+
+
+class MissingCellReason(enum.StrEnum):
+    """Enumeration of the reasons cells may be missing from a warp."""
+
+    NO_COARSE_OVERLAP = enum.auto()
+    """This cell did not overlap the {visit, detector} image in even coarse
+    convservative polygonal overlap checks.
+    """
+
+    UNEXPECTED_OVERLAP_GEOMETRY = enum.auto()
+    """The geometry of the overlap between the {visit, detector} was not
+    expected (e.g. not a convex polygon).
+    """
+
+    FAILED_PSF_EVALUATION = enum.auto()
+    """The PSF model could not be evaluated for this cell."""
+
+
+class BaseWarpImage[K: CellKernel | CellKernelWorkspace | Image](MaskedImage, ABC):
+    """A single-visit, single-detector image with the planes needed for
     warping and coaddition.
 
     Parameters
     ----------
-    image
-        The main science image.
-    mask
-        A bitmask image that annotates the main image plane.
-    variance
-        The per-pixel variance of the main image.  Note that the full
-        uncertainty includes covariance, which is not tracked per pixel.
-    coverage
-        Whether this pixel is has valid data (1.0) or not (0.0), or the
-        kernel-weighted average of such an image post-warp.
-    image_guess
-        Zero for valid data pixels, and the same value as ``image`` otherwise,
-        or the kernel-weighted average of such an image post-warp.
-    noise_realizations
-        A sequence of images with Monte Carlo realizations of the noise in
-        the image.  Each must have the same units and bounding box as
-        ``image``.
-    noise_guesses
-        A sequence of images analogous to ``image_guess``, with elements
-        corresponding to ``noise_realizations``.  May be empty if
-        ``noise_realizations`` is not, in which case each element defaults to
-        an image of zeros.
-    mask_schema
-        Schema for the mask plane.  Must be provided if and only if ``mask`` is
-        not provided.
-    sky_projection
-        Projection that maps the pixel grid to the sky.  Can only be `None` if
-        a projection is already attached to ``image``.
+    fields
+        The fields for this object.  Fields that are part of MaskedImage or
+        always images are checked for consistency; ``psf`` and ``warp_kernel``
+        correctness is the responsibility of the (subclass) caller.
 
     Notes
     -----
-    This class intentionally omits identifiers and PSF model representation so
-    those can be specialized by subclasses.
+    This is an intermediate base class intended for code reuse, not a public
+    interface or a concrete type.
     """
 
-    def __init__(
-        self,
-        image: Image,
-        *,
-        mask: Mask | None = None,
-        variance: Image | None = None,
-        coverage: Image | None = None,
-        image_guess: Image | None = None,
-        noise_realizations: Sequence[Image] = (),
-        noise_guesses: Sequence[Image] = (),
-        mask_schema: MaskSchema | None = None,
-        sky_projection: SkyProjection[Any] | None = None,
-    ):
+    def __init__(self, fields: WarpFields):
         super().__init__(
-            image,
-            mask=mask,
-            variance=variance,
-            mask_schema=mask_schema,
-            sky_projection=sky_projection,
+            image=fields["image"],
+            mask=fields["mask"],
+            variance=fields["variance"],
         )
-        if self.image.unit is None:
-            raise TypeError("The image component of a WarpWorkspace must have units.")
+        if self.image.unit != astropy.units.nJy:
+            raise TypeError(
+                "The image component of an image that will be or has been warped must have nJy units."
+            )
         if self.image.sky_projection is None:
-            raise TypeError("The sky_projection component of a WarpWorkspace cannot be None.")
-        if len(noise_guesses) not in (0, len(noise_realizations)):
+            raise TypeError(
+                "The sky_projection component of an image that will be or has been warped cannot be None."
+            )
+        for name, image_field in self._iter_extra_image_fields(fields):
+            # TODO[agent]: make sure exception types align similar lsst.images
+            # existing checks.
+            if image_field.bbox != self.image.bbox:
+                raise ValueError(
+                    f"{name}.bbox {image_field.bbox} does not match the image plane's {self.image.bbox}."
+                )
+            if image_field.sky_projection != self.image.sky_projection:
+                raise ValueError(f"{name}.sky_projection does not match the image plane's sky projection.")
+            if name == "coverage":
+                if image_field.unit is not None:
+                    raise ValueError("coverage plane must have unit=None.")
+            else:
+                if image_field.unit != self.image.unit:
+                    raise ValueError(
+                        f"{name}.unit {image_field.unit} does not match the image plane's {self.image.unit}."
+                    )
+        self._coverage = fields["coverage"]
+        self._image_guess = fields["image_guess"]
+        self._noise_realizations = list(fields["noise_realizations"])
+        self._noise_guesses = list(fields["noise_guesses"])
+        if len(self._noise_realizations) != len(self._noise_guesses):
             raise ValueError(
-                "The noise_guesses sequence must be empty or have the same length as noise_realizations."
+                f"Number of noise_realizations ({len(self._noise_realizations)} and "
+                f"noise guesses ({len(self._noise_guesses)} do not agree."
             )
-        self._coverage = self._init_plane(coverage, name="coverage", unit=None)
-        self._image_guess = self._init_plane(image_guess, name="image_guess", unit=self.image.unit)
-        self._noise_realizations = [
-            self._init_plane(v, name="noise_realizations", unit=self.image.unit) for v in noise_realizations
-        ]
-        self._noise_guesses = [
-            self._init_plane(v, name="noise_guesses", unit=self.image.unit)
-            for v in (noise_guesses or (None,) * len(noise_realizations))
-        ]
-
-    def _init_plane(self, plane: Image | None, *, name: str, unit: astropy.units.UnitBase | None) -> Image:
-        """Check an additional image plane against the main image, or replace a
-        missing one with a default image of zeros.
-
-        Parameters
-        ----------
-        plane
-            The image plane to check, or `None` for the default.  Zeros are
-            appropriate for missing data: no coverage and no guess.
-        name
-            Name of the plane, used in error messages.
-        unit
-            Units the plane must have, matching the main image.  `None` means
-            the plane must be dimensionless.
-
-        Returns
-        -------
-        plane : `~lsst.images.Image`
-            The plane, with its sky projection replaced by this image's.
-        """
-        if plane is None:
-            return Image(
-                0.0,
-                dtype=np.float32,
-                bbox=self.bbox,
-                unit=unit,
-                sky_projection=self.sky_projection,
-            )
-        if plane.bbox != self.bbox:
-            raise ValueError(f"Image ({self.bbox}) and {name} ({plane.bbox}) bboxes do not agree.")
-        if unit is None:
-            if plane.unit is not None and plane.unit != astropy.units.dimensionless_unscaled:
-                raise ValueError(f"{name} must be dimensionless, not {plane.unit}.")
-        elif plane.unit is None:
-            plane = plane.view(unit=unit)
-        elif plane.unit != unit:
-            raise ValueError(f"{name} unit ({plane.unit}) should be the same as the image's ({unit}).")
-        return plane.view(sky_projection=self.sky_projection)
+        self._psf = fields["psf"]
+        self._warp_kernel = fields["warp_kernel"]
 
     @property
     def coverage(self) -> Image:
@@ -183,88 +162,95 @@ class BaseWarpImage(MaskedImage):
         """
         return self._noise_guesses
 
-    def __getitem__(self, bbox: Box | EllipsisType) -> BaseWarpImage:
-        bbox, _ = self._handle_getitem_args(bbox)
-        return self._transfer_metadata(
-            BaseWarpImage(
-                self.image[bbox],
-                mask=self.mask[bbox],
-                variance=self.variance[bbox],
-                sky_projection=self.sky_projection,
-                coverage=self._coverage[bbox],
-                image_guess=self._image_guess[bbox],
-                noise_realizations=[v[bbox] for v in self._noise_realizations],
-                noise_guesses=[v[bbox] for v in self._noise_guesses],
-            ),
-            bbox=bbox,
-        )
+    @property
+    def psf(self) -> K:
+        """The point-spread function of the image."""
+        return self._psf
 
-    def copy(self) -> BaseWarpImage:
+    @property
+    def warp_kernel(self) -> K:
+        """The approximatiion to the point-spread function used as the warping
+        kernel.
+        """
+        return self._warp_kernel
+
+    @property
+    def unit(self) -> astropy.units.UnitBase:
+        """The units of the image plane (`astropy.units.Unit`)."""
+        return cast(astropy.units.UnitBase, super().unit)
+
+    def copy(self) -> Self:
         return self._transfer_metadata(
-            BaseWarpImage(
-                image=self._image.copy(),
-                mask=self._mask.copy(),
-                variance=self._variance.copy(),
-                sky_projection=self.sky_projection,
-                coverage=self._coverage.copy(),
-                image_guess=self._image_guess.copy(),
-                noise_realizations=[v.copy() for v in self._noise_realizations],
-                noise_guesses=[v.copy() for v in self._noise_guesses],
+            self._make_modified(
+                {
+                    "image": self._image.copy(),
+                    "mask": self._mask.copy(),
+                    "variance": self._variance.copy(),
+                    "coverage": self._coverage.copy(),
+                    "image_guess": self._image_guess.copy(),
+                    "noise_realizations": [v.copy() for v in self._noise_realizations],
+                    "noise_guesses": [v.copy() for v in self._noise_guesses],
+                    "psf": self._psf.copy(),
+                    "warp_kernel": self._warp_kernel.copy(),
+                }
             ),
             copy=True,
         )
 
+    def __getitem__(self, bbox: Box | EllipsisType) -> Self:
+        bbox, _ = self._handle_getitem_args(bbox)
+        fields = self._slice_image_fields(bbox)
+        fields["psf"] = self._slice_kernel(fields["psf"], bbox)
+        fields["warp_kernel"] = self._slice_kernel(fields["warp_kernel"], bbox)
+        return self._transfer_metadata(self._make_modified(fields), bbox=bbox)
 
-class WarpedImage(BaseWarpImage):
+    @staticmethod
+    def _iter_extra_image_fields(fields: WarpFields[K]) -> Iterator[tuple[str, Image]]:
+        for name in ("coverage", "image_guess"):
+            yield name, fields[name]
+        for name in ("noise_realizations", "noise_guesses"):
+            for n, image in enumerate(fields[name]):  # type: ignore[literal-required]
+                yield f"{name}[{n}]", image
+
+    @abstractmethod
+    def _make_modified(self, fields: WarpFields) -> Self:
+        raise NotImplementedError()
+
+    @final
+    def _slice_image_fields(self, bbox: Box) -> WarpFields:
+        """Apply bounding-box slicing to the image-like fields.
+
+        The ``psf`` and ``warp_kernel`` fields are returned unmodified.
+        """
+        return {
+            "image": self.image[bbox],
+            "mask": self.mask[bbox],
+            "variance": self.variance[bbox],
+            "coverage": self._coverage[bbox],
+            "image_guess": self._image_guess[bbox],
+            "noise_realizations": [v[bbox] for v in self._noise_realizations],
+            "noise_guesses": [v[bbox] for v in self._noise_guesses],
+            "psf": self._psf,
+            "warp_kernel": self._warp_kernel,
+        }
+
+    def _slice_kernel(self, kernel: K, bbox: Box) -> K:
+        raise TypeError("Box slicing is not supported by this warp variant.")
+
+
+@final
+class WarpedImage(BaseWarpImage[CellKernel]):
     """A single-visit, single-detector image warped onto a coadd patch.
 
     Parameters
     ----------
-    image
-        The main science image.
-    mask
-        A bitmask image that annotates the main image plane.
-    variance
-        The per-pixel variance of the main image.  Note that the full
-        uncertainty includes covariance, which is not tracked per pixel.
-    coverage
-        The kernel-weighted fraction of the input support that fell on
-        good pixels (i.e. a warp of a synthetic input image that is
-        ``1`` for good pixels and ``0`` for bad pixels).  Must be
-        dimensionless with the same bounding box as ``image`` if provided.
-        Values default to ``0.0``, meaning no data.
-    image_guess
-        The kernel-weighted average of the input image over bad pixels only
-        (i.e. a warp of a synthetic input image that is ``0`` for good pixels
-        and the current best guess for bad pixels).  Must have the same units
-        and bounding box as ``image`` if provided.  Values default to ``0.0``.
-    noise_realizations
-        A sequence of images with Monte Carlo realizations of the noise in
-        the image.  Each must have the same units and bounding box as
-        ``image``.
-    noise_guesses
-        A sequence of images analogous to ``image_guess``, with elements
-        corresponding to ``noise_realizations``.  May be empty if
-        ``noise_realizations`` is not, in which case each element defaults to
-        an image of zeros.
-    mask_schema
-        Schema for the mask plane.  Must be provided if and only if ``mask`` is
-        not provided.
-    sky_projection
-        Projection that maps the pixel grid to the sky.  Can only be `None` if
-        a projection is already attached to ``image``.
+    fields
+        The inherited fields for this object: all image and mask planes, and
+        the psf and warp kernel objects.
+    obs_info
+        Metadata about the observation.
     band
         Name of the band.
-    psf
-        Point-spread function model, processed identically to ``image``.  The
-        missing cells reported by ``psf.bounds`` are assumed to apply to all
-        image data for that cell as well (i.e. there is a PSF for a cell if
-        and only if there is image data for that cell).
-    warp_kernel
-        The transpose of the actual kernel used to warp+convolve ``image``,
-        rendered on the detector pixel grid and then processed the same way as
-        the other image planes.  This is used to whiten the noise on the
-        coadd.
     patch
         Identifiers and geometry of the full patch, if the image is confined
         to a single patch.  When present, the cell grid of the PSF and
@@ -273,40 +259,14 @@ class WarpedImage(BaseWarpImage):
     """
 
     def __init__(
-        self,
-        image: Image,
-        *,
-        mask: Mask | None = None,
-        variance: Image | None = None,
-        coverage: Image | None = None,
-        image_guess: Image | None = None,
-        noise_realizations: Sequence[Image] = (),
-        noise_guesses: Sequence[Image] = (),
-        mask_schema: MaskSchema | None = None,
-        sky_projection: SkyProjection[TractFrame] | None = None,
-        band: str | None = None,
-        psf: CellPointSpreadFunction,
-        warp_kernel: CellPointSpreadFunction,
-        patch: PatchDefinition | None = None,
+        self, fields: WarpFields[CellKernel], obs_info: ObservationInfo, band: str, patch: PatchDefinition
     ):
-        super().__init__(
-            image,
-            mask=mask,
-            variance=variance,
-            mask_schema=mask_schema,
-            sky_projection=sky_projection,
-            coverage=coverage,
-            image_guess=image_guess,
-            noise_realizations=noise_realizations,
-            noise_guesses=noise_guesses,
-        )
+        super().__init__(fields)
+        assert self.image.sky_projection is not None, "Guaranteed by super().__init__"
         if not isinstance(self.image.sky_projection.pixel_frame, TractFrame):
             raise TypeError("The sky_projection's pixel frame must be a TractFrame for WarpedImage.")
+        self._obs_info = obs_info
         self._band = band
-        if psf.bounds.bbox != self.bbox:
-            psf = psf[self.bbox.intersection(psf.bounds.bbox)]
-        self._psf = psf
-        self._warp_kernel = warp_kernel
         self._patch = patch
 
     @property
@@ -329,8 +289,28 @@ class WarpedImage(BaseWarpImage):
         return self._patch
 
     @property
-    def band(self) -> str | None:
-        """Name of the band (`str` or `None`)."""
+    def sky_projection(self) -> SkyProjection[TractFrame]:
+        """The projection that maps the pixel grid to the sky
+        (`lsst.images.SkyProjection` [`lsst.images.TractFrame`]).
+        """
+        return cast(SkyProjection[TractFrame], super().sky_projection)
+
+    @property
+    def obs_info(self) -> ObservationInfo:
+        """General information about this observation in standard form.
+        (`~astro_metadata_translator.ObservationInfo`).
+        """
+        return self._obs_info
+
+    @property
+    def physical_filter(self) -> str:
+        """Full name of the physical bandpass filter (`str`)."""
+        assert self._obs_info.physical_filter is not None, "Guaranteed at construction."
+        return self._obs_info.physical_filter
+
+    @property
+    def band(self) -> str:
+        """Short name of the bandpass filter (`str`)."""
         return self._band
 
     @property
@@ -339,83 +319,22 @@ class WarpedImage(BaseWarpImage):
         return cast(astropy.units.UnitBase, super().unit)
 
     @property
-    def sky_projection(self) -> SkyProjection[TractFrame]:
-        """The projection that maps the pixel grid to the sky
-        (`.SkyProjection` [`lsst.images.TractFrame`]).
-        """
-        return cast(SkyProjection[TractFrame], super().sky_projection)
-
-    @property
-    def psf(self) -> CellPointSpreadFunction:
-        """Point-spread function model, processed identically to `image`
-        (`lsst.images.cells.CellPointSpreadFunction`).
-        """
-        return self._psf
-
-    @property
-    def warp_kernel(self) -> CellPointSpreadFunction:
-        """The transpose of the actual kernel used to warp+convolve ``image``,
-        rendered on the detector pixel grid and then processed the same way as
-        the other image planes (`lsst.images.cells.CellPointSpreadFunction`).
-
-        This is used to whiten the noise on the
-        """
-        return self._warp_kernel
-
-    @property
     def bounds(self) -> CellGridBounds:
-        """The grid of cells that overlap this coadd and a set of missing
+        """The grid of cells that overlap this image and a set of missing
         cells (`lsst.images.cells.CellGridBounds`).
         """
         return self._psf.bounds
 
     @property
     def grid(self) -> CellGrid:
-        """The grid of cells that overlap this coadd
-        (`lsst.images.cells.CellGrid`).
-        """
+        """The patch-level grid of cells (`lsst.images.cells.CellGrid`)."""
         return self._psf.bounds.grid
 
-    def __getitem__(self, bbox: Box | EllipsisType) -> WarpedImage:
-        bbox, _ = self._handle_getitem_args(bbox)
-        return self._transfer_metadata(
-            WarpedImage(
-                self.image[bbox],
-                mask=self.mask[bbox],
-                variance=self.variance[bbox],
-                sky_projection=self.sky_projection,
-                coverage=self._coverage[bbox],
-                image_guess=self._image_guess[bbox],
-                noise_realizations=[v[bbox] for v in self._noise_realizations],
-                noise_guesses=[v[bbox] for v in self._noise_guesses],
-                band=self.band,
-                psf=self.psf[bbox],
-                warp_kernel=self.warp_kernel[bbox],
-                patch=self._patch,
-            ),
-            bbox=bbox,
-        )
+    def _make_modified(self, fields: WarpFields) -> Self:
+        return WarpedImage(fields, obs_info=self.obs_info, band=self.band, patch=self.patch)
+
+    def _slice_kernel(self, kernel: CellKernel, bbox: Box) -> CellKernel:
+        return kernel[bbox]
 
     # TODO[deferred]: add a _describe implementation
-
-    def copy(self) -> WarpedImage:
-        """Deep-copy the warped image."""
-        return self._transfer_metadata(
-            WarpedImage(
-                image=self._image.copy(),
-                mask=self._mask.copy(),
-                variance=self._variance.copy(),
-                sky_projection=self.sky_projection,
-                coverage=self._coverage.copy(),
-                image_guess=self._image_guess.copy(),
-                noise_realizations=[v.copy() for v in self._noise_realizations],
-                noise_guesses=[v.copy() for v in self._noise_guesses],
-                band=self.band,
-                psf=self.psf,
-                warp_kernel=self.warp_kernel,
-                patch=self._patch,
-            ),
-            copy=True,
-        )
-
     # TODO[deferred]: implement serialization hooks
