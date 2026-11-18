@@ -21,12 +21,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from lsst.utils.logging import LsstLogAdapter
 
 __all__ = ("GaussianKaiserWarpConfig", "GaussianKaiserWarpTask")
 
 import math
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import astropy.units
 import numpy as np
@@ -39,6 +41,7 @@ from lsst.images import (
     DetectorFrame,
     Ellipse,
     Image,
+    Mask,
     MaskPlane,
     MaskSchema,
     NoOverlapError,
@@ -52,7 +55,7 @@ from lsst.images.cells import CellGridBounds, CellIJ, CellPointSpreadFunction, P
 from lsst.pex.config import Config, DictField, Field
 from lsst.pipe.base import NoWorkFound, Task
 
-from ._warped_image import WarpedImage
+from ._warped_image import BaseWarpImage, WarpedImage
 
 
 class GaussianKaiserWarpConfig(Config):
@@ -320,4 +323,32 @@ class GaussianKaiserWarpTask(Task):
         return YX(
             y=math.ceil(self.config.kernel_n_sigma * math.sqrt(ellipse.yy)),
             x=math.ceil(self.config.kernel_n_sigma * math.sqrt(ellipse.xx)),
+        )
+
+
+class _WarpWorkspace(BaseWarpImage):
+    def __init__(
+        self,
+        image: Image,
+        *,
+        mask: Mask,
+        variance: Image,
+        coverage: Image,
+        image_guess: Image,
+        noise_realizations: Sequence[Image],
+        noise_guesses: Sequence[Image],
+        mask_schema: MaskSchema,
+        sky_projection: SkyProjection[Any],
+        psf: Image,
+    ):
+        super().__init__(
+            image=image,
+            mask=mask,
+            variance=variance,
+            coverage=coverage,
+            image_guess=image_guess,
+            noise_realizations=noise_realizations,
+            noise_guesses=noise_guesses,
+            mask_schema=mask_schema,
+            sky_projection=sky_projection,
         )
