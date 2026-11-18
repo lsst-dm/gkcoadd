@@ -59,7 +59,7 @@ class MissingCellReason(enum.StrEnum):
 
     NO_COARSE_OVERLAP = enum.auto()
     """This cell did not overlap the {visit, detector} image in even coarse
-    convservative polygonal overlap checks.
+    conservative polygonal overlap checks.
     """
 
     UNEXPECTED_OVERLAP_GEOMETRY = enum.auto()
@@ -125,15 +125,15 @@ class BaseWarpImage[K: CellKernel | CellKernelWorkspace | Image](MaskedImage, AB
         self._noise_guesses = list(fields["noise_guesses"])
         if len(self._noise_realizations) != len(self._noise_guesses):
             raise ValueError(
-                f"Number of noise_realizations ({len(self._noise_realizations)} and "
-                f"noise guesses ({len(self._noise_guesses)} do not agree."
+                f"Number of noise_realizations ({len(self._noise_realizations)}) and "
+                f"noise_guesses ({len(self._noise_guesses)}) do not agree."
             )
         self._psf = fields["psf"]
         self._warp_kernel = fields["warp_kernel"]
 
     @property
     def coverage(self) -> Image:
-        """Whether this pixel is has valid data (1.0) or not (0.0), or the
+        """Whether this pixel has valid data (1.0) or not (0.0), or the
         kernel-weighted average of such an image post-warp
         (`lsst.images.Image`).
         """
@@ -158,7 +158,7 @@ class BaseWarpImage[K: CellKernel | CellKernelWorkspace | Image](MaskedImage, AB
     def noise_guesses(self) -> Sequence[Image]:
         """A sequence of images analogous to `image_guess`, with elements
         corresponding to `noise_realizations`
-        (`~collections.abc.Sequence` [`lsst.images..Image`]).
+        (`~collections.abc.Sequence` [`lsst.images.Image`]).
         """
         return self._noise_guesses
 
@@ -169,7 +169,7 @@ class BaseWarpImage[K: CellKernel | CellKernelWorkspace | Image](MaskedImage, AB
 
     @property
     def warp_kernel(self) -> K:
-        """The approximatiion to the point-spread function used as the warping
+        """The approximation to the point-spread function used as the warping
         kernel.
         """
         return self._warp_kernel
@@ -254,7 +254,7 @@ class WarpedImage(BaseWarpImage[CellKernel]):
     patch
         Identifiers and geometry of the full patch, if the image is confined
         to a single patch.  When present, the cell grid of the PSF and
-        provenance (if provideD) must be the full patch grid, even if its
+        provenance (if provided) must be the full patch grid, even if its
         bounds select a subset of that area.
     """
 

@@ -190,8 +190,8 @@ class GaussianKaiserWarpTask(Task):
             psf_shape=YX(y=self.config.psf_size, x=self.config.psf_size),
         )
         overlap_region = self._compute_coarse_overlap(visit_image.bounds, patch, detector_to_tract)
-        # For consistency across patches, we need to generate full-detector
-        # noise realizations up front (and rng_seed_base needs to encode)
+        # Noise realizations cover the full detector and are generated up
+        # front, so cells and patches sharing a detector share the same noise.
         noise_realizations = self._generate_noise(visit_image, calibration_scaling=calibration_scaling)
         for cell_index in patch.cells:
             cell_bbox = patch.cells.bbox_of(cell_index)
@@ -209,6 +209,8 @@ class GaussianKaiserWarpTask(Task):
                 )
             ) is not None:
                 workspace.missing[cell_index] = missing_reason
+            else:
+                del workspace.missing[cell_index]
         return workspace.finish(visit_image.obs_info, band, patch)
 
     def _compute_coarse_overlap(
@@ -276,6 +278,8 @@ class GaussianKaiserWarpTask(Task):
                     array = rng.normal(
                         scale=visit_image.summary_stats.skyNoise, size=visit_image.bbox.shape
                     ).astype(np.float32)
+                case _:
+                    raise ValueError(f"Unknown noise source: {noise_source!r}.")
             if not is_calibrated:
                 if calibration_scaling is None:
                     if visit_image.photometric_scaling is None:
@@ -385,7 +389,8 @@ class GaussianKaiserWarpTask(Task):
         np.square(g.x, out=g.x)
         np.square(g.y, out=g.y)
         arg = g.x / psf_ellipse.xx + g.y / psf_ellipse.yy
-        mask = arg < self.config.kernel_n_sigma
+        # arg is squared distance in sigma units, so truncate at n_sigma**2.
+        mask = arg < self.config.kernel_n_sigma**2
         image.array[mask] = np.exp(-0.5 * arg[mask])
 
     def _do_warp(
@@ -434,8 +439,6 @@ class _SingleCellWarpWorkspace(BaseWarpImage[Image]):
                 "variance": visit_image.variance.padded_to(bbox, math.inf),
                 "coverage": Image(1.0, unit=None, **common_kwargs),
                 "image_guess": Image(0.0, unit=visit_image.unit, **common_kwargs),
-                # TODO: populate noise realizations once we've nailed down the
-                # RNG handling
                 "noise_realizations": [r.padded_to(bbox) for r in noise_realizations],
                 "noise_guesses": [
                     Image(0.0, unit=visit_image.unit, **common_kwargs) for _ in noise_realizations
@@ -479,7 +482,7 @@ class _PatchWarpWorkspace(BaseWarpImage[CellKernelWorkspace]):
             {
                 "image": Image(0.0, unit=astropy.units.nJy, **common_kwargs),
                 "mask": Mask(
-                    mask_schema.bitmask("NO_DATA"),
+                    mask_schema.bitmask("NO_DATA")[0],
                     schema=mask_schema,
                     bbox=patch.outer_bbox,
                     sky_projection=sky_projection,
@@ -507,12 +510,12 @@ class _PatchWarpWorkspace(BaseWarpImage[CellKernelWorkspace]):
     @property
     def missing(self) -> dict[CellIJ, MissingCellReason]:
         """The cells that do not have any data yet, and why
-        (`dict` [`lsst.images.CellIJ`, `MissingCellReason`]).
+        (`dict` [`lsst.images.cells.CellIJ`, `MissingCellReason`]).
 
         Notes
         -----
         This is initialized with all cells missing, and must be updated in
-        concert with the image and kernel fields manuall; no consistency is
+        concert with the image and kernel fields manually; no consistency is
         maintained by this class.
         """
         return self._missing

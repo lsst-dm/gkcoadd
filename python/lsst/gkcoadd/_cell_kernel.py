@@ -41,7 +41,7 @@ class CellKernelWorkspace:
     Parameters
     ----------
     array
-        A 4-d array of kernel images with with shape
+        A 4-d array of kernel images with shape
         ``grid.grid_size.as_tuple() + kernel_bbox.shape``.
     grid
         Definition of the full cell grid.
@@ -53,7 +53,7 @@ class CellKernelWorkspace:
 
     @classmethod
     def make_empty(cls, kernel_shape: YX[int], grid: CellGrid) -> CellKernelWorkspace:
-        """Construct an empy workspace with all kernel values set to NaN.
+        """Construct an empty workspace with all kernel values set to NaN.
 
         Parameters
         ----------
@@ -84,7 +84,7 @@ class CellKernelWorkspace:
                     raise BoundsError(f"Cell {key} is out of bounds for this kernel.")
                 return Image(self._array[key.i, key.j], bbox=self.kernel_bbox)
             case _:
-                raise TypeError(f"Invalid argument for CellGridKernelWorkspace.__getitem__: {key}")
+                raise TypeError(f"Invalid argument for CellKernelWorkspace.__getitem__: {key}")
 
     def copy(self) -> CellKernelWorkspace:
         """Return a deep copy of this kernel."""
@@ -109,7 +109,7 @@ class CellKernel:
     Parameters
     ----------
     array
-        A 4-d array of kernel images with with shape
+        A 4-d array of kernel images with shape
         ``bounds.subgrid_size.as_tuple() + kernel_bbox.shape``.  The kernel
         takes ownership of this array and flags it as read-only; external code
         that keeps a reference to it must not modify it.
@@ -153,14 +153,14 @@ class CellKernel:
         match key:
             case CellIJ():
                 if key in self._bounds.missing:
-                    raise BoundsError(f"Cell {key} is missing for this PSF.")
+                    raise BoundsError(f"Cell {key} is missing for this kernel.")
                 if not self._bounds.contains_cell(key):
-                    raise BoundsError(f"Cell {key} is out of bounds for this PSF.")
+                    raise BoundsError(f"Cell {key} is out of bounds for this kernel.")
                 index = key - self._bounds.subgrid_start
                 try:
                     return Image(self._array[index.i, index.j], bbox=self.kernel_bbox)
                 except IndexError:
-                    raise BoundsError(f"Cell {key} is out of bounds for this PSF.")
+                    raise BoundsError(f"Cell {key} is out of bounds for this kernel.")
             case Box():
                 bounds, slices = self._subset_impl(self._bounds, key)
                 return CellKernel(self._array[slices.y, slices.x, ...], bounds=bounds)
@@ -177,7 +177,7 @@ class CellKernel:
         reference to a much larger array, and copying is the only way to free
         up that memory if it is unused elsewhere.
         """
-        return CellKernel(self._array, self._bounds)
+        return CellKernel(self._array.copy(), self._bounds)
 
     @staticmethod
     def _subset_impl(bounds: CellGridBounds, bbox: Box) -> tuple[CellGridBounds, YX[slice]]:
