@@ -59,14 +59,14 @@ class GaussianKaiserWarpConfig(Config):
     """Configuration for GaussianKaiserWarpTask."""
 
     transform_atol = Field[float](
-        "Absolute tolerance in coadd pixels for approximating the transform "
-        "from the detector frame to the coadd frame.",
+        "Absolute tolerance in detector pixels for approximating the transform "
+        "from the tract frame to the detector frame.",
         default=0.005,
         dtype=float,
     )
     transform_step = Field[int](
         "Initial grid spacing in coadd pixels for approximating the transform "
-        "from the detector frame to the coadd frame.",
+        "from the tract frame to the detector frame.",
         default=25,
         dtype=int,
     )
@@ -82,7 +82,7 @@ class GaussianKaiserWarpConfig(Config):
         default=4.5,
         dtype=float,
     )
-    bad_mask_planes = DictField(
+    bad_mask_planes = DictField[str, str](
         "Mask planes that mark pixels considered unusable by this algorithm. "
         "These pixels must still be populated with finite values (e.g. by "
         "interpolation).  Dictionary values are descriptions.",
@@ -202,7 +202,7 @@ class GaussianKaiserWarpTask(Task):
         missing = {
             cell_index
             for cell_index in patch.cells
-            if not overlap_region.overlaps(patch.cells.bbox_of(cell_index).to_polygon())
+            if not overlap_region.intersects(patch.cells.bbox_of(cell_index).to_polygon())
         }
         return CellGridBounds(grid=patch.cells, bbox=patch.outer_bbox, missing=frozenset(missing))
 
@@ -243,9 +243,14 @@ class GaussianKaiserWarpTask(Task):
             overlap = visit_image.bounds.intersection(cell_on_detector)
         except NoOverlapError:
             return False
-        assert isinstance(overlap, Polygon), (
-            f"Expected cell-detector overlap to be a Polygon, not a {type(overlap).__name__}."
-        )
+        match overlap:
+            case Box():
+                overlap = overlap.to_polygon()
+            case Polygon():
+                pass
+            case _:
+                self.log.warning("Visit bounds intersection with cell %s is not a polygon.", cell_index)
+                return False
         # Work out where we evaluate the PSF model.
         nominal_tract_eval_point = XY(
             x=math.floor(cell_warp.bbox.x.center), y=math.floor(cell_warp.bbox.y.center)
