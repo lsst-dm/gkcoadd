@@ -523,11 +523,8 @@ class _SingleCellWarpWorkspace(BaseWarpImage[Image]):
         )
         # Pixels outside the bounds should generally be marked NO_DATA
         # already, but make sure; no bbox fast path, since it would miss
-        # pixels outside a polygonal bounds.  The keyword form of contains is
-        # used because Bounds.contains is overloaded on scalar vs array-like
-        # coordinates, and XY is invariant in its type parameter.
-        mesh = bbox.meshgrid()
-        out_of_bounds = np.logical_not(visit_image.bounds.contains(x=mesh.x, y=mesh.y))
+        # pixels outside a polygonal bounds.
+        out_of_bounds = np.logical_not(visit_image.bounds.contains(bbox.meshgrid()))
         result.mask.set("NO_DATA", out_of_bounds)
         bad_bitmask = result.mask.schema.bitmask(*bad_mask_planes)
         bad_pixels = (result.mask.array & bad_bitmask).any(axis=-1)
