@@ -21,8 +21,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 
+from lsst.images.psfs import PointSpreadFunction
 from lsst.utils.logging import LsstLogAdapter
 
 __all__ = ("GaussianKaiserWarpConfig", "GaussianKaiserWarpTask")
@@ -213,7 +215,7 @@ class GaussianKaiserWarpTask(Task):
             mask_schema=self.mask_schema,
             psf_shape=YX(y=self.config.psf_image_size, x=self.config.psf_image_size),
         )
-        overlap_region = self._compute_coarse_overlap(visit_image.bounds, patch, detector_to_tract)
+        overlap_region = self._compute_coarse_patch_overlap(visit_image.bounds, patch, detector_to_tract)
         # Noise realizations cover the full detector and are generated up
         # front, so cells and patches sharing a detector share the same noise.
         noise_realizations = self._generate_noise(visit_image, calibration_scaling=calibration_scaling)
@@ -223,23 +225,23 @@ class GaussianKaiserWarpTask(Task):
                 # The 'empty' state of a workspace cell already matches this
                 # condition.
                 continue
-            if (
-                missing_reason := self._warp_into_cell(
+            try:
+                self._warp_into_cell(
                     workspace[cell_index],
                     visit_image,
                     noise_realizations,
                     detector_to_tract,
                     cell_index=cell_index,
                 )
-            ) is not None:
-                workspace.missing[cell_index] = missing_reason
+            except _SkipCellError as err:
+                workspace.missing[cell_index] = err.reason
             else:
                 del workspace.missing[cell_index]
         if len(workspace.missing) == len(workspace.grid):
             raise NoWorkFound("No viable cells in warp.")
         return workspace.finish(visit_image.obs_info, band, patch)
 
-    def _compute_coarse_overlap(
+    def _compute_coarse_patch_overlap(
         self,
         detector_bounds: Bounds,
         patch: PatchDefinition,
@@ -333,28 +335,15 @@ class GaussianKaiserWarpTask(Task):
         noise_realizations: list[Image],
         detector_to_tract: Transform[DetectorFrame, TractFrame],
         cell_index: CellIJ,
-    ) -> MissingCellReason | None:
-        cell_on_detector: Polygon = output_workspace.bbox.segmentize(
-            self.config.transform_edge_length
-        ).transform(detector_to_tract.inverted())
-        try:
-            overlap = visit_image.bounds.intersection(cell_on_detector)
-        except NoOverlapError:
-            return MissingCellReason.NO_COARSE_OVERLAP
-        match overlap:
-            case Box():
-                overlap = overlap.to_polygon()
-            case Polygon():
-                pass
-            case _:
-                self.log.warning("Visit bounds intersection with cell %s is not a polygon.", cell_index)
-                return MissingCellReason.UNEXPECTED_OVERLAP_GEOMETRY
+    ) -> None:
+        overlap, contained = self._compute_cell_overlap(
+            output_workspace.bbox, visit_image.bounds, detector_to_tract, cell_index
+        )
         # Work out where we evaluate the PSF model.
         tract_eval_point = XY(
             x=math.floor(output_workspace.bbox.x.center), y=math.floor(output_workspace.bbox.y.center)
         )
-        detector_eval_point: XY[float]
-        if overlap != cell_on_detector:
+        if not contained:
             # The detector boundary goes through this cell. Take the centroid
             # of the overlap polygon (in detector coordinates), transform that
             # to tract coordinates, round it to the nearest integer. We're
@@ -366,65 +355,18 @@ class GaussianKaiserWarpTask(Task):
             # observation pixel phases is okay for shear estimation (even
             # though we plan to mitigate phase effects in other ways now).
             tract_eval_point = detector_to_tract.apply_forward(overlap.centroid).map(round)
-        detector_eval_point = detector_to_tract.apply_inverse(tract_eval_point.map(float))
-        # Compute the input PSF image and its moments, which determine the
-        # warping kernel.  We want the warp kernel to be separable for
-        # performance reasons, so we ignore psf_ellipse.xy.
-        try:
-            psf_image = visit_image.psf.compute_stellar_image(
-                x=detector_eval_point.x, y=detector_eval_point.y
-            )
-        except (ValueError, RuntimeError):
-            # PSF backends signal out-of-domain points with pex (and GalSim)
-            # RuntimeErrors; some raise ValueError.
-            self.log.warning("Could not evaluate PSF at %s for cell %s.", detector_eval_point, cell_index)
-            return MissingCellReason.FAILED_PSF_EVALUATION
-        try:
-            psf_ellipse = Ellipse.from_image_unweighted(
-                psf_image, x=detector_eval_point.x, y=detector_eval_point.y
-            ).remeasure_adaptive(psf_image)
-        except (ValueError, RuntimeError):
-            # Ellipse construction raises InvalidEllipseError (a ValueError);
-            # GalSim's HSM raises RuntimeError subclasses.
-            self.log.warning(
-                "Could not measure PSF moments at %s for cell %s.", detector_eval_point, cell_index
-            )
-            return MissingCellReason.FAILED_PSF_MOMENTS
-        if not np.isfinite(psf_ellipse.det):
-            self.log.warning("PSF moments not finite at %s for cell %s.", detector_eval_point, cell_index)
-            return MissingCellReason.FAILED_PSF_MOMENTS
-        if abs(psf_ellipse.reduced_shear) > self.config.psf_max_ellipticity:
-            self.log.warning(
-                "PSF ellipticity %f > %f at %s for cell %s.",
-                abs(psf_ellipse.reduced_shear),
-                self.config.psf_max_ellipticity,
-                detector_eval_point,
-                cell_index,
-            )
-            return MissingCellReason.FAILED_PSF_MOMENTS
-        if psf_ellipse.r_tr < self.config.psf_min_radius:
-            self.log.warning(
-                "PSF radius %f < %f at %s for cell %s.",
-                psf_ellipse.r_tr,
-                self.config.psf_min_radius,
-                detector_eval_point,
-                cell_index,
-            )
-            return MissingCellReason.FAILED_PSF_MOMENTS
-        if psf_ellipse.r_tr > self.config.psf_max_radius:
-            self.log.info(
-                "PSF radius %f > %f at %s for cell %s.",
-                psf_ellipse.r_tr,
-                self.config.psf_max_radius,
-                detector_eval_point,
-                cell_index,
-            )
-            return MissingCellReason.PSF_TOO_LARGE
+        # Evaluate and measure the PSF model.
+        psf_image, psf_ellipse = self._process_cell_input_psf(
+            visit_image.psf,
+            detector_to_tract.apply_inverse(tract_eval_point.map(float)),
+            cell_index,
+        )
         # We take the hull of the transformed cell bbox with the PSF image one
         # to guard against cases where the PSF is very large and/or was
         # evaluated close to the edge of the cell, and then we pad to the
         # kernel's support. We only want to evaluate the coordinate transform
-        # on a single grid, and this is the simplest way to do that.
+        # on a single grid when possible, and this is the simplest way to do
+        # that.
         padded_input_bbox = Box.hull(overlap.bbox, psf_image.bbox).padded(
             self._kernel_support_half_size(psf_ellipse)
         )
@@ -437,40 +379,168 @@ class GaussianKaiserWarpTask(Task):
         )
         self._render_warp_kernel(input_workspace.warp_kernel, psf_ellipse)
         # Transform all of the points in the cell.
-        image_xy: XY[np.ndarray] = detector_to_tract.apply_inverse_grid(
-            output_workspace.bbox, in_atol=self.config.transform_atol, out_step=self.config.transform_step
+        image_xy, kernel_xy = self._transform_grids(
+            image_bbox=output_workspace.bbox,
+            kernel_bbox=output_workspace.psf.bbox,
+            tract_eval_point=tract_eval_point,
+            detector_to_tract=detector_to_tract,
         )
-        # The PSF and warp_kernel input images are in regular detector
-        # coordinates, but we want to warp those to the
-        # output_workspace.psf.bbox coordinate system where tract_eval_point
-        # becomes (0, 0).
-        centered_bbox = output_workspace.psf.bbox
-        kernel_output_bbox = Box.factory[
-            tract_eval_point.y + centered_bbox.y.start : tract_eval_point.y + centered_bbox.y.stop,
-            tract_eval_point.x + centered_bbox.x.start : tract_eval_point.x + centered_bbox.x.stop,
-        ]
-        if output_workspace.bbox.contains(kernel_output_bbox):
-            # In the usual case, kernel output box is fully within the cell,
-            # so we've already computed its input-frame coordinate arrays.
-            # YX[slice] indexes ndarray members directly (it is a tuple).
-            kernel_slices = kernel_output_bbox.slice_within(output_workspace.bbox)
-            kernel_xy = XY(x=image_xy.x[kernel_slices], y=image_xy.y[kernel_slices])
-        else:
-            # When the kernel is too close to the edge of the cell, we need
-            # to transform new points.  This is rare enough that we don't
-            # bother with partial reuse of already-transformed points.
-            kernel_xy = detector_to_tract.apply_inverse_grid(
-                kernel_output_bbox, in_atol=self.config.transform_atol, out_step=self.config.transform_step
-            )
         return self._do_warp(output_workspace, input_workspace, psf_ellipse, image_xy, kernel_xy)
 
+    def _compute_cell_overlap(
+        self,
+        output_bbox: Box,
+        input_bounds: Bounds,
+        detector_to_tract: Transform[DetectorFrame, TractFrame],
+        cell_index: CellIJ,
+    ) -> tuple[Polygon, bool]:
+        """Compute the overlap between a cell and the input visit image.
+
+        Parameters
+        ----------
+        output_bbox
+            The output cell bounding box, in tract coordinates.
+        input_bounds
+            The bounds of the input visit image; typically (but not
+            necessarily) just its bounding box.
+        detector_to_tract
+            Coordinate transform from detector coordinates to tract
+            coordinates.
+        cell_index
+            Index of the cell being processed.
+
+        Returns
+        -------
+        overlap : `lsst.images.Polygon`
+            The overlap polygon in detector coordinates.
+        contained : `bool`
+            `True` if the cell lies wholly within the detector, `False` if
+            it's on the boundary.
+        """
+        cell_on_detector: Polygon = output_bbox.segmentize(self.config.transform_edge_length).transform(
+            detector_to_tract.inverted()
+        )
+        try:
+            overlap = input_bounds.intersection(cell_on_detector)
+        except NoOverlapError:
+            return MissingCellReason.NO_COARSE_OVERLAP
+        match overlap:
+            case Box():
+                overlap = overlap.to_polygon()
+            case Polygon():
+                pass
+            case _:
+                self.log.warning("Visit bounds intersection with cell %s is not a polygon.", cell_index)
+                raise _SkipCellError(MissingCellReason.UNEXPECTED_OVERLAP_GEOMETRY)
+        return overlap, overlap == cell_on_detector
+
+    def _process_cell_input_psf(
+        self,
+        input_psf: PointSpreadFunction,
+        eval_point: XY[float],
+        cell_index: CellIJ,
+    ) -> tuple[Image, Ellipse]:
+        """Evaluate and measure the moments of the input PSF for a cell.
+
+        Parameters
+        ----------
+        input_psf
+            The PSF model to evaluate.
+        eval_point
+            Where to evaluate the PSF, in detector coordinates.
+        cell_index
+            Index of the cell being processed.
+
+        Returns
+        -------
+        psf_image : `lsst.images.Image`
+            Image of the PSF, in detector coordinates.
+        psf_ellipse : `lsst.images.Ellipse`
+            Second-moments ellipse of the PSF model at the eval point.
+        """
+        # Compute the input PSF image and its moments, which determine the
+        # warping kernel.  We want the warp kernel to be separable for
+        # performance reasons, so we ignore psf_ellipse.xy.
+        try:
+            psf_image = input_psf.compute_stellar_image(x=eval_point.x, y=eval_point.y)
+        except (ValueError, RuntimeError):
+            # PSF backends signal out-of-domain points with pex (and GalSim)
+            # RuntimeErrors; some raise ValueError.
+            self.log.warning("Could not evaluate PSF at %s for cell %s.", eval_point, cell_index)
+            raise _SkipCellError(MissingCellReason.FAILED_PSF_EVALUATION)
+        try:
+            psf_ellipse = Ellipse.from_image_unweighted(
+                psf_image, x=eval_point.x, y=eval_point.y
+            ).remeasure_adaptive(psf_image)
+        except (ValueError, RuntimeError):
+            # Ellipse construction raises InvalidEllipseError (a ValueError);
+            # GalSim's HSM raises RuntimeError subclasses.
+            self.log.warning("Could not measure PSF moments at %s for cell %s.", eval_point, cell_index)
+            raise _SkipCellError(MissingCellReason.FAILED_PSF_MOMENTS)
+        if abs(psf_ellipse.reduced_shear) > self.config.psf_max_ellipticity:
+            self.log.warning(
+                "PSF ellipticity %f > %f at %s for cell %s.",
+                abs(psf_ellipse.reduced_shear),
+                self.config.psf_max_ellipticity,
+                eval_point,
+                cell_index,
+            )
+            raise _SkipCellError(MissingCellReason.FAILED_PSF_MOMENTS)
+        if psf_ellipse.r_tr < self.config.psf_min_radius:
+            self.log.warning(
+                "PSF radius %f < %f at %s for cell %s.",
+                psf_ellipse.r_tr,
+                self.config.psf_min_radius,
+                eval_point,
+                cell_index,
+            )
+            raise _SkipCellError(MissingCellReason.FAILED_PSF_MOMENTS)
+        if psf_ellipse.r_tr > self.config.psf_max_radius:
+            self.log.info(
+                "PSF radius %f > %f at %s for cell %s.",
+                psf_ellipse.r_tr,
+                self.config.psf_max_radius,
+                eval_point,
+                cell_index,
+            )
+            raise _SkipCellError(MissingCellReason.PSF_TOO_LARGE)
+        return psf_image, psf_ellipse
+
     def _kernel_support_half_size(self, ellipse: Ellipse) -> YX[int]:
+        """Return the half-size of the kernel's support box.
+
+        Parameters
+        ----------
+        ellipse
+            PSF second-moments ellipse.
+
+        Returns
+        -------
+        `lsst.images.YX` [`int`]
+            Half-size of the kernel's support box.  The support box shape
+            is twice this *plus one*, since it always has odd dimensions.
+        """
         return YX(
             y=math.ceil(self.config.kernel_n_sigma * math.sqrt(ellipse.yy)),
             x=math.ceil(self.config.kernel_n_sigma * math.sqrt(ellipse.xx)),
         )
 
     def _render_warp_kernel(self, image: Image, psf_ellipse: Ellipse) -> None:
+        """Render the PSF-approximating Gaussian warp kernel.
+
+        Parameters
+        ----------
+        image
+            Image to write into.
+        psf_ellipse
+            PSF second-moments ellipse.
+
+        Notes
+        -----
+        The `~lsst.images.Ellipse.xy` cross-moment is ignored, since it's more
+        important for this kernel to be separable than it is for it to
+        approximate the PSF closely.
+        """
         g = image.bbox.meshgrid()
         g.x[...] -= psf_ellipse.center.x
         g.y[...] -= psf_ellipse.center.y
@@ -481,6 +551,62 @@ class GaussianKaiserWarpTask(Task):
         mask = arg < self.config.kernel_n_sigma**2
         image.array[mask] = np.exp(-0.5 * arg[mask])
         image.array /= image.array.sum()
+
+    def _transform_grids(
+        self,
+        image_bbox: Box,
+        kernel_bbox: Box,
+        tract_eval_point: XY[int],
+        detector_to_tract: Transform[DetectorFrame, TractFrame],
+    ) -> tuple[XY[np.ndarray], XY[np.ndarray]]:
+        """Compute the input pixel coordinates on the image and kernel
+        output grids.
+
+        Parameters
+        ----------
+        image_bbox
+            Bounding box of the tract-coordinate regular output image planes.
+        kernel_bbox
+            Bounding box of the output kernel image planes, centered on zero.
+        tract_eval_point
+            The tract coordinate that corresponds to (0, 0) in ``kernel_bbox``.
+        detector_to_tract
+            Coordinate transform from detector coordinates to tract
+            coordinates.
+
+        Returns
+        -------
+        image_xy : `XY` [`numpy.ndarray`]
+            Grid of detector-coordinate values for the output image planes.
+        kernel_xy : `XY` [`numpy.ndarray`]
+            Grid of detector-coordinate values for the output PSF and
+            warp kernel planes.
+        """
+        image_xy: XY[np.ndarray] = detector_to_tract.apply_inverse_grid(
+            image_bbox, in_atol=self.config.transform_atol, out_step=self.config.transform_step
+        )
+        # The PSF and warp_kernel input images are in regular detector
+        # coordinates, but we want to warp those to the
+        # centered_kernel_bbox coordinate system where tract_eval_point
+        # becomes (0, 0).
+        tract_kernel_bbox = Box.factory[
+            tract_eval_point.y + kernel_bbox.y.start : tract_eval_point.y + kernel_bbox.y.stop,
+            tract_eval_point.x + kernel_bbox.x.start : tract_eval_point.x + kernel_bbox.x.stop,
+        ]
+        if image_bbox.contains(tract_kernel_bbox):
+            # In the usual case, kernel output box is fully within the cell,
+            # so we've already computed its input-frame coordinate arrays.
+            # YX[slice] indexes ndarray members directly (it is a tuple).
+            kernel_slices = tract_kernel_bbox.slice_within(image_bbox)
+            kernel_xy = XY(x=image_xy.x[kernel_slices], y=image_xy.y[kernel_slices])
+        else:
+            # When the kernel is too close to the edge of the cell, we need
+            # to transform new points.  This is rare enough that we don't
+            # bother with partial reuse of already-transformed points.
+            kernel_xy = detector_to_tract.apply_inverse_grid(
+                tract_kernel_bbox, in_atol=self.config.transform_atol, out_step=self.config.transform_step
+            )
+        return image_xy, kernel_xy
 
     def _do_warp(
         self,
@@ -512,6 +638,13 @@ class GaussianKaiserWarpTask(Task):
             output images.
         """
         raise NotImplementedError("TODO")
+
+
+class _SkipCellError(RuntimeError):
+    """Exception raised when a warp cell should be skipped."""
+
+    def __init__(self, reason: MissingCellReason):
+        self.reason = reason
 
 
 @final
