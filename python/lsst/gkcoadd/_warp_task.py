@@ -102,20 +102,41 @@ class GaussianKaiserWarpConfig(Config):
             "SATURATED": "This pixel was saturated.",
         },
     )
-    psf_size = Field[int](
-        "Size of warped/convolved PSF images (in both X and Y).",
+    psf_image_size = Field[int](
+        "Size of output warped/convolved PSF images (in both X and Y).",
         dtype=int,
         default=41,
     )
+    psf_max_ellipticity = Field[float](
+        "Maximum PSF ellipticity (reduced shear). "
+        "PSFs with ellipticities larger than this are considered suspicious and their cells are dropped.",
+        dtype=float,
+        # TODO[agent]: replace this with the
+        default=15.0,
+    )
+    psf_min_radius = Field[float](
+        "Minimum PSF moment trace radius in detector pixels. "
+        "PSFs smaller than this are considered suspicious and their cells dropped.",
+        dtype=float,
+        default=1.0,
+    )
+    psf_max_radius = Field[float](
+        "Maximum PSF moment trace radius in detector pixels. "
+        "PSFs larger than this are expected to be truncated at psf_image_size and their cells are dropped.",
+        dtype=float,
+        default=15.0,
+    )
     noise_realization_sources = ListField[str](
         "A list of variance sources to use for each noise realization. "
-        "Values may be 'pixel' for the per-pixel variance plane or an ObservationSummaryStats field like "
-        "'skyNoise' or 'meanVar' for constant (before calibration) per-detector noise.",
+        "Values may be 'pixel' for the per-pixel variance plane or an ObservationSummaryStats "
+        "('skyNoise' or 'meanVar' are currently supported) for constant (before calibration) "
+        "per-detector noise.",
         dtype=str,
         default=["meanVar"] * 3,
     )
     noise_seed_offset = Field[int](
-        "An offset added to the random number seed for all noise realizations.",
+        "An offset included in the random number seed for all noise realizations, "
+        "along with the visit and detector IDs.",
         dtype=int,
         default=0,
     )
@@ -187,7 +208,7 @@ class GaussianKaiserWarpTask(Task):
             sky_projection,
             len(self.config.noise_realization_sources),
             mask_schema=self.mask_schema,
-            psf_shape=YX(y=self.config.psf_size, x=self.config.psf_size),
+            psf_shape=YX(y=self.config.psf_image_size, x=self.config.psf_image_size),
         )
         overlap_region = self._compute_coarse_overlap(visit_image.bounds, patch, detector_to_tract)
         # Noise realizations cover the full detector and are generated up
@@ -211,6 +232,8 @@ class GaussianKaiserWarpTask(Task):
                 workspace.missing[cell_index] = missing_reason
             else:
                 del workspace.missing[cell_index]
+        if len(workspace.missing) == len(workspace.grid):
+            raise NoWorkFound("No viable cells in warp.")
         return workspace.finish(visit_image.obs_info, band, patch)
 
     def _compute_coarse_overlap(
@@ -255,29 +278,30 @@ class GaussianKaiserWarpTask(Task):
             image's calibrated units.  Computed on first use if not provided.
         """
         result: list[Image] = []
-        for index, noise_source in enumerate(self.config.noise_realization_sources):
-            # TODO[agent]: is detector_exposure_id reliably populated in
-            # from_legacy conversions, or do we need a fallback? Also, should
-            # we be using SeedSequence here instead of index offsets somehow?
-            if visit_image.obs_info.detector_exposure_id is None:
-                raise InvalidQuantumError("ObservationInfo.detector_exposure_id is not populated.")
-            seed = visit_image.obs_info.detector_exposure_id + self.config.noise_seed_offset + index
-            # TODO[agent]: does numpy have a native float32 RNG we should use
-            # instead?
-            rng = np.random.default_rng(seed)
+        if (visit_id := visit_image.obs_info.visit_id) is None:
+            raise InvalidQuantumError("ObservationInfo.visit_id is not populated.")
+        if (detector_num := visit_image.obs_info.detector_num) is None:
+            raise InvalidQuantumError("ObservationInfo.detector_num is not populated.")
+        rng_seed_seq = np.random.SeedSequence(entropy=[visit_id, detector_num, self.config.noise_seed_offset])
+        for rng_seed, noise_source in zip(
+            rng_seed_seq.spawn(len(self.config.noise_realization_sources)),
+            self.config.noise_realization_sources,
+        ):
+            rng = np.random.default_rng(rng_seed)
             is_calibrated = False
             match noise_source:
                 case "pixel":
-                    array = rng.normal(scale=visit_image.variance.array**0.5).astype(np.float32)
+                    scale = visit_image.variance.array.astype(np.float32, copy=False) ** 0.5
+                    array = rng.standard_normal(size=scale.shape, dtype=np.float32) * scale
                     is_calibrated = True
                 case "meanVar":
-                    array = rng.normal(
-                        scale=visit_image.summary_stats.meanVar**0.5, size=visit_image.bbox.shape
-                    ).astype(np.float32)
+                    array = rng.standard_normal(size=visit_image.bbox.shape, dtype=np.float32) * np.float32(
+                        visit_image.summary_stats.meanVar**0.5
+                    )
                 case "skyNoise":
-                    array = rng.normal(
-                        scale=visit_image.summary_stats.skyNoise, size=visit_image.bbox.shape
-                    ).astype(np.float32)
+                    array = rng.standard_normal(size=visit_image.bbox.shape, dtype=np.float32) * np.float32(
+                        visit_image.summary_stats.skyNoise
+                    )
                 case _:
                     raise ValueError(f"Unknown noise source: {noise_source!r}.")
             if not is_calibrated:
@@ -349,15 +373,51 @@ class GaussianKaiserWarpTask(Task):
                 x=detector_eval_point.x, y=detector_eval_point.y
             )
         except Exception:  # TODO[agent]: can we narrow this?
-            self.log.warning("Could not evaluate PSF at %s for cell %s", detector_eval_point, cell_index)
+            self.log.warning("Could not evaluate PSF at %s for cell %s.", detector_eval_point, cell_index)
             return MissingCellReason.FAILED_PSF_EVALUATION
-        psf_ellipse = Ellipse.from_image_unweighted(
-            psf_image, x=detector_eval_point.x, y=detector_eval_point.y
-        ).remeasure_adaptive(psf_image)
+        try:
+            psf_ellipse = Ellipse.from_image_unweighted(
+                psf_image, x=detector_eval_point.x, y=detector_eval_point.y
+            ).remeasure_adaptive(psf_image)
+        except Exception:  # TODO[agent]: narrow this
+            self.log.warning(
+                "Could not measure PSF moments at %s for cell %s.", detector_eval_point, cell_index
+            )
+            return MissingCellReason.FAILED_PSF_MOMENTS
+        if not np.isfinite(psf_ellipse.det):
+            self.log.warning("PSF moments not finite at %s for cell %s.", detector_eval_point, cell_index)
+            return MissingCellReason.FAILED_PSF_MOMENTS
+        if abs(psf_ellipse.reduced_shear) > self.config.psf_max_ellipticity:
+            self.log.warning(
+                "PSF ellipticity %f > %f at %s for cell %s.",
+                abs(psf_ellipse.reduced_shear),
+                self.config.psf_max_ellipticity,
+                detector_eval_point,
+                cell_index,
+            )
+            return MissingCellReason.FAILED_PSF_MOMENTS
+        if psf_ellipse.r_tr < self.config.psf_min_radius:
+            self.log.warning(
+                "PSF radius %f < %f at %s for cell %s.",
+                psf_ellipse.r_tr,
+                self.config.psf_min_radius,
+                detector_eval_point,
+                cell_index,
+            )
+            return MissingCellReason.FAILED_PSF_MOMENTS
+        if psf_ellipse.r_tr > self.config.psf_max_radius:
+            self.log.info(
+                "PSF radius %f > %f at %s for cell %s.",
+                psf_ellipse.r_tr,
+                self.config.psf_max_radius,
+                detector_eval_point,
+                cell_index,
+            )
+            return MissingCellReason.PSF_TOO_LARGE
         # We take the hull of the transformed cell bbox with the PSF image one
         # to guard against cases where the PSF is very large and/or was
         # evaluated close to the edge of the cell, and then we pad to the
-        # kernel's support.  We only want to evaluate the coordinate transform
+        # kernel's support. We only want to evaluate the coordinate transform
         # on a single grid, and this is the simplest way to do that.
         padded_input_bbox = Box.hull(overlap.bbox, psf_image.bbox).padded(
             self._kernel_support_half_size(psf_ellipse)
@@ -392,6 +452,7 @@ class GaussianKaiserWarpTask(Task):
         # arg is squared distance in sigma units, so truncate at n_sigma**2.
         mask = arg < self.config.kernel_n_sigma**2
         image.array[mask] = np.exp(-0.5 * arg[mask])
+        image.array /= image.array.sum()
 
     def _do_warp(
         self,
@@ -435,7 +496,13 @@ class _SingleCellWarpWorkspace(BaseWarpImage[Image]):
         result = cls(
             {
                 "image": visit_image.image.padded_to(bbox),
-                "mask": visit_image.mask.padded_to(bbox, ["NO_DATA"]),
+                # always_copy: the NO_DATA marking below must not write
+                # through into the visit image when bbox fits inside it.
+                "mask": visit_image.mask.padded_to(bbox, ["NO_DATA"], always_copy=True),
+                # TODO: 'inf' as a fill value is problematic here, because the
+                # kernel will spread it around.  We need a scheme for using
+                # 'coverage' to inflate variances in the coadd sum instead.
+                # I hope that doesn't require a variance-coverage plane.
                 "variance": visit_image.variance.padded_to(bbox, math.inf),
                 "coverage": Image(1.0, unit=None, **common_kwargs),
                 "image_guess": Image(0.0, unit=visit_image.unit, **common_kwargs),
@@ -447,6 +514,12 @@ class _SingleCellWarpWorkspace(BaseWarpImage[Image]):
                 "warp_kernel": Image(0.0, unit=None, **common_kwargs),
             }
         )
+        # Pixels outside the bounds should generally be marked NO_DATA
+        # already, but make sure; no bbox fast path, since it would miss
+        # pixels outside a polygonal bounds.
+        # TODO[agent]: mypy is being picky about this.  What's the best fix?
+        out_of_bounds = np.logical_not(visit_image.bounds.contains(bbox.meshgrid()))
+        result.mask.set("NO_DATA", out_of_bounds)
         bad_bitmask = result.mask.schema.bitmask(*bad_mask_planes)
         bad_pixels = (result.mask.array & bad_bitmask).any(axis=-1)
         result.coverage.array[bad_pixels] = 0
@@ -482,7 +555,7 @@ class _PatchWarpWorkspace(BaseWarpImage[CellKernelWorkspace]):
             {
                 "image": Image(0.0, unit=astropy.units.nJy, **common_kwargs),
                 "mask": Mask(
-                    mask_schema.bitmask("NO_DATA")[0],
+                    mask_schema.bitmask("NO_DATA"),
                     schema=mask_schema,
                     bbox=patch.outer_bbox,
                     sky_projection=sky_projection,

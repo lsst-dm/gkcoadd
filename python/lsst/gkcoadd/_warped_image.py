@@ -70,6 +70,13 @@ class MissingCellReason(enum.StrEnum):
     FAILED_PSF_EVALUATION = enum.auto()
     """The PSF model could not be evaluated for this cell."""
 
+    FAILED_PSF_MOMENTS = enum.auto()
+    """The PSF model's moments could not be computed or had suspicious values.
+    """
+
+    PSF_TOO_LARGE = enum.auto()
+    """The PSF was too large."""
+
 
 class BaseWarpImage[K: CellKernel | CellKernelWorkspace | Image](MaskedImage, ABC):
     """A single-visit, single-detector image with the planes needed for
@@ -281,11 +288,7 @@ class WarpedImage(BaseWarpImage[CellKernel]):
 
     @property
     def patch(self) -> PatchDefinition:
-        """Identifiers and geometry of the full patch, if the image is confined
-        to a single patch (`PatchDefinition`).
-        """
-        if self._patch is None:
-            raise AttributeError("Coadd has no patch information.")
+        """Identifiers and geometry of the full patch (`PatchDefinition`)."""
         return self._patch
 
     @property
@@ -312,11 +315,6 @@ class WarpedImage(BaseWarpImage[CellKernel]):
     def band(self) -> str:
         """Short name of the bandpass filter (`str`)."""
         return self._band
-
-    @property
-    def unit(self) -> astropy.units.UnitBase:
-        """The units of the image plane (`astropy.units.Unit`)."""
-        return cast(astropy.units.UnitBase, super().unit)
 
     @property
     def bounds(self) -> CellGridBounds:
