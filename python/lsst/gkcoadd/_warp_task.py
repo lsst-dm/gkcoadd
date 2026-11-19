@@ -152,7 +152,15 @@ class GaussianKaiserWarpConfig(Config):
 
 
 class GaussianKaiserWarpTask(Task):
-    """A task for fused Gaussian-convolution/warping."""
+    """A task for fused Gaussian-convolution/warping.
+
+    Parameters
+    ----------
+    config
+        Configuration for the task.
+    **kwargs
+        Forwarded to `lsst.pipe.base.Task`.
+    """
 
     _DefaultName: ClassVar[str] = "warp"
     ConfigClass: ClassVar[type[GaussianKaiserWarpConfig]] = GaussianKaiserWarpConfig
@@ -639,7 +647,12 @@ class GaussianKaiserWarpTask(Task):
 
 
 class _SkipCellError(Exception):
-    """Exception raised when a warp cell should be skipped."""
+    """Exception raised when a warp cell should be skipped.
+
+    This is an internal exception for per-cell operations that should always
+    be handled in the loop over cells; an instance should never propagate up
+    beyond that loop.
+    """
 
     def __init__(self, reason: MissingCellReason):
         self.reason = reason
@@ -773,6 +786,15 @@ class _PatchWarpWorkspace(BaseWarpImage[CellKernelWorkspace]):
     def finish(self, obs_info: ObservationInfo, band: str, patch: PatchDefinition) -> WarpedImage:
         """Finish building the warp, converting this object into a
         `WarpedImage`.
+
+        Parameters
+        ----------
+        obs_info
+            Observational metadata to attach.
+        band
+            Bandpass filter name to attach.
+        patch
+            Patch geometry to attach.
         """
         return WarpedImage(
             {
