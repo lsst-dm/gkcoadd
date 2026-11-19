@@ -21,7 +21,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Sequence
 
 from lsst.images.psfs import PointSpreadFunction
@@ -385,7 +384,7 @@ class GaussianKaiserWarpTask(Task):
             tract_eval_point=tract_eval_point,
             detector_to_tract=detector_to_tract,
         )
-        return self._do_warp(output_workspace, input_workspace, psf_ellipse, image_xy, kernel_xy)
+        self._do_warp(output_workspace, input_workspace, psf_ellipse, image_xy, kernel_xy)
 
     def _compute_cell_overlap(
         self,
@@ -423,7 +422,7 @@ class GaussianKaiserWarpTask(Task):
         try:
             overlap = input_bounds.intersection(cell_on_detector)
         except NoOverlapError:
-            return MissingCellReason.NO_COARSE_OVERLAP
+            raise _SkipCellError(MissingCellReason.NO_COARSE_OVERLAP)
         match overlap:
             case Box():
                 overlap = overlap.to_polygon()
@@ -586,9 +585,8 @@ class GaussianKaiserWarpTask(Task):
             image_bbox, in_atol=self.config.transform_atol, out_step=self.config.transform_step
         )
         # The PSF and warp_kernel input images are in regular detector
-        # coordinates, but we want to warp those to the
-        # centered_kernel_bbox coordinate system where tract_eval_point
-        # becomes (0, 0).
+        # coordinates, but we want to warp those to the kernel_bbox coordinate
+        # system, where tract_eval_point becomes (0, 0).
         tract_kernel_bbox = Box.factory[
             tract_eval_point.y + kernel_bbox.y.start : tract_eval_point.y + kernel_bbox.y.stop,
             tract_eval_point.x + kernel_bbox.x.start : tract_eval_point.x + kernel_bbox.x.stop,
@@ -615,7 +613,7 @@ class GaussianKaiserWarpTask(Task):
         kernel_ellipse: Ellipse,
         image_xy: XY[np.ndarray],
         kernel_xy: XY[np.ndarray],
-    ) -> MissingCellReason | None:
+    ) -> None:
         """Actually do the warping.
 
         Parameters
@@ -640,7 +638,7 @@ class GaussianKaiserWarpTask(Task):
         raise NotImplementedError("TODO")
 
 
-class _SkipCellError(RuntimeError):
+class _SkipCellError(Exception):
     """Exception raised when a warp cell should be skipped."""
 
     def __init__(self, reason: MissingCellReason):
