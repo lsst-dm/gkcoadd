@@ -350,10 +350,9 @@ class GaussianKaiserWarpTask(Task):
                 self.log.warning("Visit bounds intersection with cell %s is not a polygon.", cell_index)
                 return MissingCellReason.UNEXPECTED_OVERLAP_GEOMETRY
         # Work out where we evaluate the PSF model.
-        nominal_tract_eval_point = XY(
+        tract_eval_point = XY(
             x=math.floor(output_workspace.bbox.x.center), y=math.floor(output_workspace.bbox.y.center)
         )
-        tract_eval_point: XY[int] = nominal_tract_eval_point
         detector_eval_point: XY[float]
         if overlap != cell_on_detector:
             # The detector boundary goes through this cell. Take the centroid
@@ -438,10 +437,30 @@ class GaussianKaiserWarpTask(Task):
         )
         self._render_warp_kernel(input_workspace.warp_kernel, psf_ellipse)
         # Transform all of the points in the cell.
-        xy: XY[np.ndarray] = detector_to_tract.apply_inverse_grid(
+        image_xy: XY[np.ndarray] = detector_to_tract.apply_inverse_grid(
             output_workspace.bbox, in_atol=self.config.transform_atol, out_step=self.config.transform_step
         )
-        return self._do_warp(output_workspace, input_workspace, psf_ellipse, xy)
+        # The PSF and warp_kernel input images are in regular detector
+        # coordinates, but we want to warp those to the
+        # output_workspace.psf.bbox coordinate system where tract_eval_point
+        # becomes (0, 0).
+        centered_bbox = output_workspace.psf.bbox
+        kernel_output_bbox = Box.factory[
+            tract_eval_point.y + centered_bbox.y.start : tract_eval_point.y + centered_bbox.y.stop,
+            tract_eval_point.x + centered_bbox.x.start : tract_eval_point.x + centered_bbox.x.stop,
+        ]
+        if output_workspace.bbox.contains(kernel_output_bbox):
+            # In the usual case, kernel output box is fully within the cell,
+            # so we've already computed its input-frame coordinate arrays.
+            kernel_xy = image_xy[kernel_output_bbox.slice_within(output_workspace.bbox)]
+        else:
+            # When the kernel is too close to the edge of the cell, we need
+            # to transform new points.  This is rare enough that we don't
+            # bother with partial reuse of already-transformed points.
+            kernel_xy = detector_to_tract.apply_inverse_grid(
+                kernel_output_bbox, in_atol=self.config.transform_atol, out_step=self.config.transform_step
+            )
+        return self._do_warp(output_workspace, input_workspace, psf_ellipse, image_xy, kernel_xy)
 
     def _kernel_support_half_size(self, ellipse: Ellipse) -> YX[int]:
         return YX(
@@ -466,7 +485,8 @@ class GaussianKaiserWarpTask(Task):
         output_workspace: _SingleCellWarpWorkspace,
         input_workspace: _SingleCellWarpWorkspace,
         kernel_ellipse: Ellipse,
-        xy: XY[np.ndarray],
+        image_xy: XY[np.ndarray],
+        kernel_xy: XY[np.ndarray],
     ) -> MissingCellReason | None:
         """Actually do the warping.
 
@@ -480,9 +500,14 @@ class GaussianKaiserWarpTask(Task):
             pixel.
         kernel_ellipse
             The ellipse that defines the Gaussian warping kernel.
-        xy
-            Arrays with the input pixel coordinate value for every output
-            pixels; shapes are the same as ``output_workspace.bbox.shape``.
+        image_xy
+            Arrays with the input pixel coordinate value for every image
+            output pixel; shapes are the same as
+            ``output_workspace.bbox.shape``.
+        kernel_xy
+            Arrays with the input pixel coordinate values for ``psf``
+            and ``warp_kernel`` output pixels; shapes are the same as those
+            output images.
         """
         raise NotImplementedError("TODO")
 
@@ -523,8 +548,11 @@ class _SingleCellWarpWorkspace(BaseWarpImage[Image]):
         )
         # Pixels outside the bounds should generally be marked NO_DATA
         # already, but make sure; no bbox fast path, since it would miss
-        # pixels outside a polygonal bounds.
-        out_of_bounds = np.logical_not(visit_image.bounds.contains(bbox.meshgrid()))
+        # pixels outside a polygonal bounds.  The keyword form of contains is
+        # used because Bounds.contains is overloaded on scalar vs array-like
+        # coordinates, and XY is invariant in its type parameter.
+        mesh = bbox.meshgrid()
+        out_of_bounds = np.logical_not(visit_image.bounds.contains(x=mesh.x, y=mesh.y))
         result.mask.set("NO_DATA", out_of_bounds)
         bad_bitmask = result.mask.schema.bitmask(*bad_mask_planes)
         bad_pixels = (result.mask.array & bad_bitmask).any(axis=-1)
