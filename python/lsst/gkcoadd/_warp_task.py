@@ -452,7 +452,9 @@ class GaussianKaiserWarpTask(Task):
         if output_workspace.bbox.contains(kernel_output_bbox):
             # In the usual case, kernel output box is fully within the cell,
             # so we've already computed its input-frame coordinate arrays.
-            kernel_xy = image_xy[kernel_output_bbox.slice_within(output_workspace.bbox)]
+            # YX[slice] indexes ndarray members directly (it is a tuple).
+            kernel_slices = kernel_output_bbox.slice_within(output_workspace.bbox)
+            kernel_xy = XY(x=image_xy.x[kernel_slices], y=image_xy.y[kernel_slices])
         else:
             # When the kernel is too close to the edge of the cell, we need
             # to transform new points.  This is rare enough that we don't
@@ -548,11 +550,8 @@ class _SingleCellWarpWorkspace(BaseWarpImage[Image]):
         )
         # Pixels outside the bounds should generally be marked NO_DATA
         # already, but make sure; no bbox fast path, since it would miss
-        # pixels outside a polygonal bounds.  The keyword form of contains is
-        # used because Bounds.contains is overloaded on scalar vs array-like
-        # coordinates, and XY is invariant in its type parameter.
-        mesh = bbox.meshgrid()
-        out_of_bounds = np.logical_not(visit_image.bounds.contains(x=mesh.x, y=mesh.y))
+        # pixels outside a polygonal bounds.
+        out_of_bounds = np.logical_not(visit_image.bounds.contains(bbox.meshgrid()))
         result.mask.set("NO_DATA", out_of_bounds)
         bad_bitmask = result.mask.schema.bitmask(*bad_mask_planes)
         bad_pixels = (result.mask.array & bad_bitmask).any(axis=-1)
