@@ -54,7 +54,7 @@ from lsst.images import (
     VisitImage,
 )
 from lsst.images.cells import CellGrid, CellIJ, PatchDefinition
-from lsst.pex.config import Config, DictField, Field, ListField
+from lsst.pex.config import Config, DictField, Field, ListField, RangeField
 from lsst.pipe.base import InvalidQuantumError, NoWorkFound, Task, UpstreamFailureNoWorkFound
 
 from ._cell_kernel import CellKernelWorkspace
@@ -107,11 +107,15 @@ class GaussianKaiserWarpConfig(Config):
         dtype=int,
         default=41,
     )
-    psf_max_ellipticity = Field[float](
-        "Maximum PSF axis ratio (a/b). "
-        "PSFs more elongated than this are considered suspicious and their cells are dropped.",
+    psf_max_ellipticity = RangeField(
+        "Maximum PSF ellipticity (reduced shear). "
+        "PSFs with ellipticities larger than this are considered suspicious and their cells are dropped.",
         dtype=float,
-        default=15.0,
+        default=0.5,
+        min=0.0,
+        max=1.0,
+        inclusiveMin=False,
+        inclusiveMax=False,
     )
     psf_min_radius = Field[float](
         "Minimum PSF moment trace radius in detector pixels. "
@@ -390,13 +394,10 @@ class GaussianKaiserWarpTask(Task):
         if not np.isfinite(psf_ellipse.det):
             self.log.warning("PSF moments not finite at %s for cell %s.", detector_eval_point, cell_index)
             return MissingCellReason.FAILED_PSF_MOMENTS
-        # The Ellipse constructor enforces det >= 0, which bounds
-        # |reduced_shear| < 1; the unbounded "too elongated" measure is a/b.
-        elongation = psf_ellipse.a / psf_ellipse.b if psf_ellipse.b > 0 else math.inf
-        if elongation > self.config.psf_max_ellipticity:
+        if abs(psf_ellipse.reduced_shear) > self.config.psf_max_ellipticity:
             self.log.warning(
-                "PSF axis ratio %f > %f at %s for cell %s.",
-                elongation,
+                "PSF ellipticity %f > %f at %s for cell %s.",
+                abs(psf_ellipse.reduced_shear),
                 self.config.psf_max_ellipticity,
                 detector_eval_point,
                 cell_index,
