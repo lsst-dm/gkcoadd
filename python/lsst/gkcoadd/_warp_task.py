@@ -108,15 +108,14 @@ class GaussianKaiserWarpConfig(Config):
         default=41,
     )
     psf_max_ellipticity = Field[float](
-        "Maximum PSF ellipticity (reduced shear). "
-        "PSFs with ellipticities larger than this are considered suspicious and their cells are dropped.",
+        "Maximum PSF axis ratio (a/b). "
+        "PSFs more elongated than this are considered suspicious and their cells are dropped.",
         dtype=float,
-        # TODO[agent]: replace this with the
         default=15.0,
     )
     psf_min_radius = Field[float](
         "Minimum PSF moment trace radius in detector pixels. "
-        "PSFs smaller than this are considered suspicious and their cells dropped.",
+        "PSFs smaller than this are considered suspicious and their cells are dropped.",
         dtype=float,
         default=1.0,
     )
@@ -372,14 +371,18 @@ class GaussianKaiserWarpTask(Task):
             psf_image = visit_image.psf.compute_stellar_image(
                 x=detector_eval_point.x, y=detector_eval_point.y
             )
-        except Exception:  # TODO[agent]: can we narrow this?
+        except (ValueError, RuntimeError):
+            # PSF backends signal out-of-domain points with pex (and GalSim)
+            # RuntimeErrors; some raise ValueError.
             self.log.warning("Could not evaluate PSF at %s for cell %s.", detector_eval_point, cell_index)
             return MissingCellReason.FAILED_PSF_EVALUATION
         try:
             psf_ellipse = Ellipse.from_image_unweighted(
                 psf_image, x=detector_eval_point.x, y=detector_eval_point.y
             ).remeasure_adaptive(psf_image)
-        except Exception:  # TODO[agent]: narrow this
+        except (ValueError, RuntimeError):
+            # Ellipse construction raises InvalidEllipseError (a ValueError);
+            # GalSim's HSM raises RuntimeError subclasses.
             self.log.warning(
                 "Could not measure PSF moments at %s for cell %s.", detector_eval_point, cell_index
             )
@@ -387,10 +390,13 @@ class GaussianKaiserWarpTask(Task):
         if not np.isfinite(psf_ellipse.det):
             self.log.warning("PSF moments not finite at %s for cell %s.", detector_eval_point, cell_index)
             return MissingCellReason.FAILED_PSF_MOMENTS
-        if abs(psf_ellipse.reduced_shear) > self.config.psf_max_ellipticity:
+        # The Ellipse constructor enforces det >= 0, which bounds
+        # |reduced_shear| < 1; the unbounded "too elongated" measure is a/b.
+        elongation = psf_ellipse.a / psf_ellipse.b if psf_ellipse.b > 0 else math.inf
+        if elongation > self.config.psf_max_ellipticity:
             self.log.warning(
-                "PSF ellipticity %f > %f at %s for cell %s.",
-                abs(psf_ellipse.reduced_shear),
+                "PSF axis ratio %f > %f at %s for cell %s.",
+                elongation,
                 self.config.psf_max_ellipticity,
                 detector_eval_point,
                 cell_index,
@@ -516,9 +522,11 @@ class _SingleCellWarpWorkspace(BaseWarpImage[Image]):
         )
         # Pixels outside the bounds should generally be marked NO_DATA
         # already, but make sure; no bbox fast path, since it would miss
-        # pixels outside a polygonal bounds.
-        # TODO[agent]: mypy is being picky about this.  What's the best fix?
-        out_of_bounds = np.logical_not(visit_image.bounds.contains(bbox.meshgrid()))
+        # pixels outside a polygonal bounds.  The keyword form of contains is
+        # used because Bounds.contains is overloaded on scalar vs array-like
+        # coordinates, and XY is invariant in its type parameter.
+        mesh = bbox.meshgrid()
+        out_of_bounds = np.logical_not(visit_image.bounds.contains(x=mesh.x, y=mesh.y))
         result.mask.set("NO_DATA", out_of_bounds)
         bad_bitmask = result.mask.schema.bitmask(*bad_mask_planes)
         bad_pixels = (result.mask.array & bad_bitmask).any(axis=-1)
